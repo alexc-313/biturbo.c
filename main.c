@@ -69,7 +69,7 @@ int main(int argc, char** argv) {
 
     bt_config_t* cfg = &model.config;
     fprintf(stderr, "biturbo: %d layers, %d/%d heads, head_dim=%d, "
-            "KV cache INT4 (%d blk/head)\n",
+            "KV cache TQ4 (RHT+codebook+QJL, %d blk/head)\n",
             cfg->n_layers, cfg->n_heads, cfg->n_kv_heads,
             BT_HEAD_DIM(cfg),
             (BT_HEAD_DIM(cfg) + BT_QK - 1) / BT_QK);

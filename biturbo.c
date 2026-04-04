@@ -322,79 +322,233 @@ static void rope(float* vec, int head_dim, int n_heads, int pos, float theta) {
 }
 
 /* ================================================================
- * §6. KV CACHE — TurboQuant INT4 (Stage 9)
+ * §6. TURBOQUANT KV CACHE (Stage 9)
+ *
+ * Real TurboQuant: RHT + Lloyd-Max 3-bit codebook + QJL residual.
+ * K attention: two-stage inner product (codebook dot + QJL XNOR)
+ * V dequant:   MSE-only point-wise (codebook → inverse RHT)
  * ================================================================ */
 
-static void kv_quantize_int4(bt_kv_block_t* blocks, const float* src,
-                             int dim, int blocks_per_head) {
-    for (int b = 0; b < blocks_per_head; b++) {
-        bt_kv_block_t* blk = &blocks[b];
-        int offset = b * BT_QK;
-        int count = dim - offset;
-        if (count > BT_QK) count = BT_QK;
+#define TQ_DEFAULT_SEED 0x12345678u
+#define TQ_PI_2         1.5707963267948966f  /* pi/2 */
 
-        float mn = src[offset], mx = src[offset];
-        for (int i = 1; i < count; i++) {
-            float v = src[offset + i];
-            if (v < mn) mn = v;
-            if (v > mx) mx = v;
-        }
-        float range = mx - mn;
-        if (range < 1e-8f) range = 1e-8f;
-        float scale = range / 16.0f;
+/* Lloyd-Max optimal centroids for N(0,1), 3-bit (8 levels) */
+static const float TQ_CENTROIDS[8] = {
+    -2.1520f, -1.3440f, -0.7560f, -0.2451f,
+     0.2451f,  0.7560f,  1.3440f,  2.1520f
+};
 
-        blk->scale = bt_f32_to_f16(scale);
-        blk->zero_point = bt_f32_to_f16(mn);
+/* ── RHT support ── */
 
-        memset(blk->qs, 0, BT_QK / 2);
-        for (int i = 0; i < count; i++) {
-            int q = (int)floorf((src[offset + i] - mn) / scale);
-            if (q < 0) q = 0;
-            if (q > 15) q = 15;
-            if (i % 2 == 0)
-                blk->qs[i / 2] = (uint8_t)q;
-            else
-                blk->qs[i / 2] |= (uint8_t)(q << 4);
+static int tq_random_sign(uint32_t seed, int idx) {
+    uint32_t h = seed ^ (uint32_t)idx;
+    h = h * 2654435761u;
+    return (h & 1) ? 1 : -1;
+}
+
+static void tq_walsh_hadamard(float* data, int n) {
+    for (int len = 1; len < n; len <<= 1) {
+        for (int i = 0; i < n; i += len << 1) {
+            for (int j = 0; j < len; j++) {
+                float u = data[i + j];
+                float v = data[i + j + len];
+                data[i + j]       = u + v;
+                data[i + j + len] = u - v;
+            }
         }
     }
 }
 
-/* Dot product: float query with INT4-quantized key */
-static float dot_q_kv4(const float* query, const bt_kv_block_t* blocks,
-                       int head_dim, int bph) {
-    float dot = 0.0f;
-    for (int b = 0; b < bph; b++) {
-        const bt_kv_block_t* blk = &blocks[b];
-        float sc = bt_f16_to_f32(blk->scale);
-        float mn = bt_f16_to_f32(blk->zero_point);
-        int off = b * BT_QK;
-        int cnt = head_dim - off;
-        if (cnt > BT_QK) cnt = BT_QK;
-        for (int i = 0; i < cnt; i++) {
-            uint8_t byte = blk->qs[i / 2];
-            int q = (i % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
-            dot += query[off + i] * (mn + ((float)q + 0.5f) * sc);
-        }
-    }
-    return dot;
+static void tq_rht_forward(float* data, int n, uint32_t seed) {
+    int n2 = 1;
+    while (n2 * 2 <= n) n2 *= 2;
+    for (int i = 0; i < n2; i++)
+        data[i] *= (float)tq_random_sign(seed, i);
+    tq_walsh_hadamard(data, n2);
+    float scale = 1.0f / sqrtf((float)n2);
+    for (int i = 0; i < n2; i++)
+        data[i] *= scale;
 }
 
-/* Weighted accumulate: out += weight * dequantized INT4 vector */
-static void accum_kv4(float* out, float weight, const bt_kv_block_t* blocks,
-                      int head_dim, int bph) {
-    for (int b = 0; b < bph; b++) {
-        const bt_kv_block_t* blk = &blocks[b];
-        float sc = bt_f16_to_f32(blk->scale);
-        float mn = bt_f16_to_f32(blk->zero_point);
-        int off = b * BT_QK;
-        int cnt = head_dim - off;
-        if (cnt > BT_QK) cnt = BT_QK;
-        for (int i = 0; i < cnt; i++) {
-            uint8_t byte = blk->qs[i / 2];
-            int q = (i % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
-            out[off + i] += weight * (mn + ((float)q + 0.5f) * sc);
+static void tq_rht_inverse(float* data, int n, uint32_t seed) {
+    int n2 = 1;
+    while (n2 * 2 <= n) n2 *= 2;
+    float scale = 1.0f / sqrtf((float)n2);
+    for (int i = 0; i < n2; i++)
+        data[i] *= scale;
+    tq_walsh_hadamard(data, n2);
+    for (int i = 0; i < n2; i++)
+        data[i] *= (float)tq_random_sign(seed, i);
+}
+
+/* ── Codebook quantize/dequantize ── */
+
+static void tq_codebook_quantize(const float* src, uint8_t* indices,
+                                  int n, float inv_std) {
+    for (int i = 0; i < n; i++) {
+        float x = src[i] * inv_std;
+        int best = 0;
+        float best_dist = fabsf(x - TQ_CENTROIDS[0]);
+        for (int c = 1; c < 8; c++) {
+            float dist = fabsf(x - TQ_CENTROIDS[c]);
+            if (dist < best_dist) { best_dist = dist; best = c; }
         }
+        indices[i] = (uint8_t)best;
     }
+}
+
+static void tq_codebook_dequantize(const uint8_t* indices, float* dst,
+                                    int n, float inv_std) {
+    float std_val = (inv_std > 1e-10f) ? (1.0f / inv_std) : 1.0f;
+    for (int i = 0; i < n; i++)
+        dst[i] = TQ_CENTROIDS[indices[i]] * std_val;
+}
+
+/* ── 3-bit packing (LSB-first bitstream) ── */
+
+static void tq_pack_3bit(const uint8_t* indices, uint8_t* packed, int n) {
+    int total_bytes = (n * 3 + 7) / 8;
+    memset(packed, 0, (size_t)total_bytes);
+    for (int i = 0; i < n; i++) {
+        int bit_offset = i * 3;
+        int byte_idx = bit_offset / 8;
+        int bit_pos  = bit_offset % 8;
+        uint16_t val = (uint16_t)(indices[i] & 0x07);
+        packed[byte_idx] |= (uint8_t)(val << bit_pos);
+        if (bit_pos > 5)
+            packed[byte_idx + 1] |= (uint8_t)(val >> (8 - bit_pos));
+    }
+}
+
+static void tq_unpack_3bit(const uint8_t* packed, uint8_t* indices, int n) {
+    for (int i = 0; i < n; i++) {
+        int bit_offset = i * 3;
+        int byte_idx = bit_offset / 8;
+        int bit_pos  = bit_offset % 8;
+        uint16_t val = (uint16_t)packed[byte_idx];
+        if (bit_pos > 5 && byte_idx + 1 < (n * 3 + 7) / 8)
+            val |= (uint16_t)packed[byte_idx + 1] << 8;
+        indices[i] = (uint8_t)((val >> bit_pos) & 0x07);
+    }
+}
+
+/* ── QJL (Quantized Johnson-Lindenstrauss) ── */
+
+static float tq_qjl_entry(int dim_idx, int sketch_idx) {
+    uint32_t h = (uint32_t)(dim_idx * 2654435761u + sketch_idx * 340573321u);
+    h ^= h >> 16;
+    h *= 0x45d9f3b;
+    h ^= h >> 16;
+    return (h & 1) ? 1.0f : -1.0f;
+}
+
+static void tq_compute_qjl_signs(const float* residual, uint8_t* signs,
+                                  int dim, int n_sketch) {
+    int hash_bytes = n_sketch / 8;
+    memset(signs, 0, (size_t)hash_bytes);
+    for (int s = 0; s < n_sketch; s++) {
+        float proj = 0.0f;
+        for (int d = 0; d < dim; d++)
+            proj += residual[d] * tq_qjl_entry(d, s);
+        if (proj > 0.0f)
+            signs[s / 8] |= (uint8_t)(1 << (s % 8));
+    }
+}
+
+/* ── Main TurboQuant functions ── */
+
+/* Quantize a float vector into a TurboQuant 4-bit block.
+ * Used for both K and V cache storage. */
+static void tq_quantize(bt_kv_block_t* blk, const float* src, int dim) {
+    /* Step 1: L2 norm */
+    float norm_sq = 0.0f;
+    for (int i = 0; i < dim; i++) norm_sq += src[i] * src[i];
+    float norm = sqrtf(norm_sq);
+    blk->norm = bt_f32_to_f16(norm);
+
+    /* Step 2: Normalize to unit vector */
+    float rotated[BT_QK];
+    float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+    for (int i = 0; i < dim; i++) rotated[i] = src[i] * inv_norm;
+    for (int i = dim; i < BT_QK; i++) rotated[i] = 0.0f;
+
+    /* Step 3: RHT to decorrelate channels */
+    uint32_t seed = TQ_DEFAULT_SEED;
+    blk->rht_seed = seed;
+    tq_rht_forward(rotated, dim, seed);
+
+    /* Step 4: Quantize with 3-bit Lloyd-Max codebook.
+     * After RHT, coords ~ N(0, 1/sqrt(dim)), so inv_std = sqrt(dim) → N(0,1) */
+    float inv_std = sqrtf((float)dim);
+    uint8_t indices[BT_QK];
+    tq_codebook_quantize(rotated, indices, dim, inv_std);
+    tq_pack_3bit(indices, blk->mse_indices, dim);
+
+    /* Step 5: Compute residual for QJL */
+    float reconstructed[BT_QK];
+    tq_codebook_dequantize(indices, reconstructed, dim, inv_std);
+    float residual[BT_QK];
+    float r_norm_sq = 0.0f;
+    for (int i = 0; i < dim; i++) {
+        residual[i] = rotated[i] - reconstructed[i];
+        r_norm_sq += residual[i] * residual[i];
+    }
+    for (int i = dim; i < BT_QK; i++) residual[i] = 0.0f;
+    blk->residual_norm = bt_f32_to_f16(sqrtf(r_norm_sq));
+
+    /* Step 6: QJL 1-bit sign hash on residual */
+    tq_compute_qjl_signs(residual, blk->qjl_signs, dim, dim);
+}
+
+/* Two-stage attention dot product: MSE codebook + QJL correction.
+ * q_rht and q_qjl are pre-computed once per query head. */
+static float tq_attention_dot(const float* q_rht, const float* q_qjl,
+                               const bt_kv_block_t* blk, int dim) {
+    float norm = bt_f16_to_f32(blk->norm);
+    float r_norm = bt_f16_to_f32(blk->residual_norm);
+    float inv_std = sqrtf((float)dim);
+
+    /* Stage 1: MSE dot in rotated space */
+    uint8_t indices[BT_QK];
+    tq_unpack_3bit(blk->mse_indices, indices, dim);
+    float mse_dot = 0.0f;
+    float std_val = 1.0f / inv_std;
+    for (int d = 0; d < dim; d++)
+        mse_dot += q_rht[d] * TQ_CENTROIDS[indices[d]] * std_val;
+
+    /* Stage 2: QJL residual correction */
+    float qjl_correction = 0.0f;
+    int sketch_dim = dim;
+    for (int s = 0; s < sketch_dim; s++) {
+        int bit = (blk->qjl_signs[s / 8] >> (s % 8)) & 1;
+        float key_sign = bit ? 1.0f : -1.0f;
+        qjl_correction += q_qjl[s] * key_sign;
+    }
+    qjl_correction *= sqrtf(TQ_PI_2) / (float)sketch_dim * r_norm;
+
+    return norm * (mse_dot + qjl_correction);
+}
+
+/* MSE-only point-wise dequant + weighted accumulate (for V cache).
+ * No QJL — QJL is only for inner product estimation. */
+static void tq_dequant_accum(float* out, float weight,
+                              const bt_kv_block_t* blk, int dim) {
+    float norm = bt_f16_to_f32(blk->norm);
+    float inv_std = sqrtf((float)dim);
+
+    /* Dequantize in rotated space */
+    uint8_t indices[BT_QK];
+    tq_unpack_3bit(blk->mse_indices, indices, dim);
+    float rotated[BT_QK];
+    tq_codebook_dequantize(indices, rotated, dim, inv_std);
+
+    /* Inverse RHT to return to original space */
+    tq_rht_inverse(rotated, dim, blk->rht_seed);
+
+    /* Scale by norm and accumulate */
+    float w = weight * norm;
+    for (int i = 0; i < dim; i++)
+        out[i] += w * rotated[i];
 }
 
 /* ================================================================
@@ -439,7 +593,6 @@ void bt_forward(bt_model_t* model, int token, int pos) {
     for (int l = 0; l < cfg->n_layers; l++) {
         bt_layer_weights_t* lw = &w->layers[l];
         bt_kv_cache_t* kv = &s->kv[l];
-        int bph = kv->blocks_per_head;
 
         /* Stage 3: Pre-attention RMS norm */
         rms_norm(s->xb, s->x, lw->attn_norm, dim, cfg->norm_eps);
@@ -454,16 +607,14 @@ void bt_forward(bt_model_t* model, int token, int pos) {
         rope(s->q, head_dim, n_heads, pos, cfg->rope_theta);
         rope(s->k, head_dim, n_kv_heads, pos, cfg->rope_theta);
 
-        /* Stage 9: Store K/V into INT4 quantized cache */
+        /* Stage 9: Store K/V into TurboQuant cache */
         for (int h = 0; h < n_kv_heads; h++) {
-            size_t idx = (size_t)h * cfg->max_seq_len * bph + (size_t)pos * bph;
-            kv_quantize_int4(&kv->k_cache[idx], s->k + h * head_dim,
-                             head_dim, bph);
-            kv_quantize_int4(&kv->v_cache[idx], s->v + h * head_dim,
-                             head_dim, bph);
+            size_t idx = (size_t)h * cfg->max_seq_len + (size_t)pos;
+            tq_quantize(&kv->k_cache[idx], s->k + h * head_dim, head_dim);
+            tq_quantize(&kv->v_cache[idx], s->v + h * head_dim, head_dim);
         }
 
-        /* Stage 10: Attention scores (GQA) */
+        /* Stage 10: Attention scores (GQA with TurboQuant) */
         int seq_len = pos + 1;
         float att_scale = 1.0f / sqrtf((float)head_dim);
         for (int qh = 0; qh < n_heads; qh++) {
@@ -471,22 +622,32 @@ void bt_forward(bt_model_t* model, int token, int pos) {
             int kv_head = qh / gqa_groups;
             float* att = s->att + (size_t)qh * cfg->max_seq_len;
 
+            /* Precompute RHT(query) and QJL projection ONCE per query head */
+            memcpy(s->q_rht, qhead, head_dim * sizeof(float));
+            tq_rht_forward(s->q_rht, head_dim, TQ_DEFAULT_SEED);
+            for (int j = 0; j < head_dim; j++) {
+                float proj = 0.0f;
+                for (int d = 0; d < head_dim; d++)
+                    proj += s->q_rht[d] * tq_qjl_entry(d, j);
+                s->q_qjl[j] = proj;
+            }
+
+            /* Two-stage dot product for each cached key position */
             for (int t = 0; t < seq_len; t++) {
-                size_t ki = (size_t)kv_head * cfg->max_seq_len * bph
-                          + (size_t)t * bph;
-                att[t] = dot_q_kv4(qhead, &kv->k_cache[ki], head_dim, bph)
+                size_t ki = (size_t)kv_head * cfg->max_seq_len + (size_t)t;
+                att[t] = tq_attention_dot(s->q_rht, s->q_qjl,
+                                          &kv->k_cache[ki], head_dim)
                        * att_scale;
             }
             softmax(att, seq_len);
 
-            /* Weighted V sum → xb2[qh * head_dim] */
+            /* Weighted V sum with MSE-only dequant */
             float* out_h = s->xb2 + qh * head_dim;
             memset(out_h, 0, head_dim * sizeof(float));
             for (int t = 0; t < seq_len; t++) {
                 if (att[t] < 1e-8f) continue;
-                size_t vi = (size_t)kv_head * cfg->max_seq_len * bph
-                          + (size_t)t * bph;
-                accum_kv4(out_h, att[t], &kv->v_cache[vi], head_dim, bph);
+                size_t vi = (size_t)kv_head * cfg->max_seq_len + (size_t)t;
+                tq_dequant_accum(out_h, att[t], &kv->v_cache[vi], head_dim);
             }
         }
 
@@ -838,9 +999,12 @@ static int alloc_state(bt_state_t* s, const bt_config_t* cfg) {
     s->att    = (float*)bt_calloc((size_t)cfg->n_heads * cfg->max_seq_len,
                                   sizeof(float));
     s->q8_buf = (int8_t*)bt_calloc(max_buf, sizeof(int8_t));
+    int head_dim = BT_HEAD_DIM(cfg);
+    s->q_rht  = (float*)bt_calloc(head_dim, sizeof(float));
+    s->q_qjl  = (float*)bt_calloc(head_dim, sizeof(float));
     s->logits = (float*)bt_calloc(cfg->vocab_size, sizeof(float));
 
-    int head_dim = BT_HEAD_DIM(cfg);
+    /* TurboQuant KV cache: 1 block per head (head_dim=128=BT_QK) */
     int bph = (head_dim + BT_QK - 1) / BT_QK;
 
     s->kv = (bt_kv_cache_t*)bt_calloc(cfg->n_layers, sizeof(bt_kv_cache_t));
@@ -1140,7 +1304,7 @@ void bt_free_model(bt_model_t* model) {
     free(s->x); free(s->xb); free(s->xb2);
     free(s->hb); free(s->hb2);
     free(s->q); free(s->k); free(s->v);
-    free(s->att); free(s->q8_buf); free(s->logits);
+    free(s->att); free(s->q8_buf); free(s->q_rht); free(s->q_qjl); free(s->logits);
     if (s->kv) {
         for (int l = 0; l < model->config.n_layers; l++) {
             free(s->kv[l].k_cache);

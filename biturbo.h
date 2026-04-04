@@ -64,18 +64,22 @@ typedef struct {
 } bt_i2s_weight_t;
 
 /* ============================================================
- * TurboQuant INT4 KV cache block
+ * TurboQuant KV cache block (4-bit: 3-bit codebook + 1-bit QJL)
  *
- * Uniform min-max 4-bit quantization per block of 128 elements.
+ * Pipeline: normalize → RHT → Lloyd-Max codebook → QJL residual
+ * Attention: RHT(query) once → codebook dot + QJL XNOR correction
+ * V dequant: codebook lookup → inverse RHT → scale by norm
  * ============================================================ */
 
-#define BT_QK 128
+#define BT_QK 128  /* block size (elements per block) */
 
 typedef struct {
-    uint16_t scale;             /* (max - min) / 16, fp16    */
-    uint16_t zero_point;        /* minimum value, fp16       */
-    uint8_t  qs[BT_QK / 2];    /* 4-bit packed, LSB-first   */
-} bt_kv_block_t;
+    uint16_t norm;                      /* L2 norm of original vector (fp16) */
+    uint16_t residual_norm;             /* L2 norm of quantization residual  */
+    uint32_t rht_seed;                  /* RHT random seed                   */
+    uint8_t  mse_indices[BT_QK*3/8];   /* 3-bit packed codebook idx (48B)   */
+    uint8_t  qjl_signs[BT_QK/8];       /* 1-bit QJL sign hash (16B)         */
+} bt_kv_block_t;                        /* 72 bytes per 128 elements         */
 
 /* ============================================================
  * KV cache (per layer)
@@ -146,6 +150,8 @@ typedef struct {
     float* v;           /* value [kv_dim]                            */
     float* att;         /* attention scores [n_heads, max_seq_len]   */
     int8_t* q8_buf;     /* quantized activations scratch             */
+    float* q_rht;       /* RHT-rotated query scratch [head_dim]      */
+    float* q_qjl;       /* QJL query projection scratch [head_dim]   */
     float* logits;      /* output logits [vocab_size]                */
     bt_kv_cache_t* kv;  /* [n_layers] KV cache                      */
 } bt_state_t;
