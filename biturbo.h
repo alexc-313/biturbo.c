@@ -94,6 +94,7 @@ typedef struct {
 typedef struct {
     char**   vocab;         /* token strings, indexed by token id  */
     float*   scores;        /* merge priority scores               */
+    int*     sorted_idx;    /* vocab indices sorted by string       */
     int      vocab_size;
     int      bos_id;
     int      eos_id;

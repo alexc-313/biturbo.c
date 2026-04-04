@@ -37,6 +37,16 @@
 #endif
 
 /* ================================================================
+ * VOCAB SORT HELPER (for building binary search index)
+ * ================================================================ */
+
+static char** bt_sort_vocab_global;
+static int bt_sort_vocab_cmp(const void* a, const void* b) {
+    return strcmp(bt_sort_vocab_global[*(const int*)a],
+                 bt_sort_vocab_global[*(const int*)b]);
+}
+
+/* ================================================================
  * MEMORY HELPERS
  * ================================================================ */
 
@@ -597,13 +607,75 @@ int bt_sample(bt_sampler_t* s, const float* logits, int vocab_size) {
 
 /* ================================================================
  * §10. TOKENIZER (Stage 1) — BPE from GGUF metadata
+ *
+ * GPT-2 BPE uses a byte-to-unicode mapping so all 256 byte values
+ * can be represented as unique Unicode characters in the vocabulary:
+ *   - Printable ASCII 0x21-0x7E → identity (same codepoint)
+ *   - Latin-1 0xA1-0xAC, 0xAE-0xFF → identity
+ *   - Everything else (0x00-0x20, 0x7F-0xA0, 0xAD) → U+0100..U+0143
+ * Notably: space (0x20) → U+0120 (Ġ), newline (0x0A) → U+010A (Ċ)
+ *
+ * Encoding: raw bytes → byte-to-unicode → per-byte vocab lookup → BPE merge
+ * Decoding: token string → unicode-to-byte reverse mapping → raw bytes
  * ================================================================ */
 
-static int tok_lookup(const bt_tokenizer_t* tok, const char* str, int len) {
-    for (int i = 0; i < tok->vocab_size; i++) {
-        if ((int)strlen(tok->vocab[i]) == len &&
-            memcmp(tok->vocab[i], str, len) == 0)
-            return i;
+/* Convert a raw byte to its GPT-2 BPE UTF-8 string (1-3 bytes + NUL).
+ * Returns the number of bytes written (excluding NUL). */
+static int byte_to_bpe(unsigned char byte, char out[4]) {
+    if (byte >= 0x21 && byte <= 0x7E) {
+        /* Printable ASCII: maps to itself */
+        out[0] = (char)byte;
+        out[1] = '\0';
+        return 1;
+    }
+    /* Compute the Unicode codepoint for this byte */
+    int cp;
+    if ((byte >= 0xA1 && byte <= 0xAC) || (byte >= 0xAE)) {
+        /* Latin-1 printable: identity mapping */
+        cp = byte;
+    } else if (byte <= 0x20) {
+        /* 0x00-0x20 (includes space) → U+0100..U+0120 */
+        cp = 0x100 + byte;
+    } else if (byte == 0x7F) {
+        cp = 0x121;  /* DEL → U+0121 */
+    } else if (byte >= 0x80 && byte <= 0xA0) {
+        cp = 0x122 + (byte - 0x80);  /* 0x80-0xA0 → U+0122..U+0142 */
+    } else {
+        cp = 0x143;  /* 0xAD (soft hyphen) → U+0143 */
+    }
+    /* Encode codepoint as UTF-8 (all are <= U+0143, so 2 bytes) */
+    out[0] = (char)(0xC0 | (cp >> 6));
+    out[1] = (char)(0x80 | (cp & 0x3F));
+    out[2] = '\0';
+    return 2;
+}
+
+/* Reverse mapping: BPE codepoints U+0100..U+0143 → raw byte values */
+static const uint8_t BPE_N2B[68] = {
+    0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07, /* U+0100-0107 */
+    0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F, /* U+0108-010F */
+    0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17, /* U+0110-0117 */
+    0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F, /* U+0118-011F */
+    0x20,                                      /* U+0120 = space */
+    0x7F,                                      /* U+0121 = DEL */
+    0x80,0x81,0x82,0x83,0x84,0x85,0x86,0x87, /* U+0122-0129 */
+    0x88,0x89,0x8A,0x8B,0x8C,0x8D,0x8E,0x8F, /* U+012A-0131 */
+    0x90,0x91,0x92,0x93,0x94,0x95,0x96,0x97, /* U+0132-0139 */
+    0x98,0x99,0x9A,0x9B,0x9C,0x9D,0x9E,0x9F, /* U+013A-0141 */
+    0xA0,                                      /* U+0142 = NBSP */
+    0xAD,                                      /* U+0143 = soft hyphen */
+};
+
+/* Binary search vocab lookup using sorted index. O(log V). */
+static int tok_lookup(const bt_tokenizer_t* tok, const char* str) {
+    if (!tok->sorted_idx) return -1;
+    int lo = 0, hi = tok->vocab_size - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        int cmp = strcmp(str, tok->vocab[tok->sorted_idx[mid]]);
+        if (cmp == 0) return tok->sorted_idx[mid];
+        if (cmp < 0) hi = mid - 1;
+        else lo = mid + 1;
     }
     return -1;
 }
@@ -611,69 +683,106 @@ static int tok_lookup(const bt_tokenizer_t* tok, const char* str, int len) {
 int bt_encode(const bt_tokenizer_t* tok, const char* text,
               int* tokens, int max_tokens, int add_bos) {
     if (!text || !tokens) return 0;
+
+    int text_len = (int)strlen(text);
+    if (text_len == 0 && !add_bos) return 0;
+
+    /* Work buffer for per-byte tokens before BPE merging */
+    int* work = (int*)malloc((text_len + 1) * sizeof(int));
+    if (!work) return 0;
+    int n_work = 0;
+
+    /* Step 1: Convert each raw byte to its BPE unicode token.
+     * "Where is" → bytes [57 68 65 72 65 20 69 73]
+     *            → BPE   [W  h  e  r  e  Ġ  i  s ]
+     *            → tokens [54 71 68 81 68 220 72 82] */
+    for (int i = 0; i < text_len; i++) {
+        char bpe[4];
+        byte_to_bpe((unsigned char)text[i], bpe);
+        int id = tok_lookup(tok, bpe);
+        if (id >= 0) {
+            work[n_work++] = id;
+        }
+        /* If not found, skip byte (shouldn't happen with valid vocab) */
+    }
+
+    /* Step 2: BPE merge loop — greedily merge the highest-scored adjacent pair.
+     * [W, h, e, r, e, Ġ, i, s] → [Wh, e, r, e, Ġ, is]
+     * → [Wh, ere, Ġ, is] → [Where, Ġis] → done (no more merges) */
+    char merge_buf[1024];
+    while (n_work >= 2) {
+        float best_score = -1e30f;
+        int best_idx = -1, best_tok = -1;
+
+        for (int i = 0; i < n_work - 1; i++) {
+            const char* s1 = tok->vocab[work[i]];
+            const char* s2 = tok->vocab[work[i + 1]];
+            int l1 = (int)strlen(s1);
+            int l2 = (int)strlen(s2);
+            if (l1 + l2 >= (int)sizeof(merge_buf)) continue;
+            memcpy(merge_buf, s1, l1);
+            memcpy(merge_buf + l1, s2, l2);
+            merge_buf[l1 + l2] = '\0';
+
+            int id = tok_lookup(tok, merge_buf);
+            if (id >= 0 && tok->scores[id] > best_score) {
+                best_score = tok->scores[id];
+                best_idx = i;
+                best_tok = id;
+            }
+        }
+        if (best_idx < 0) break;
+
+        work[best_idx] = best_tok;
+        for (int i = best_idx + 1; i < n_work - 1; i++)
+            work[i] = work[i + 1];
+        n_work--;
+    }
+
+    /* Step 3: Copy to output with optional BOS prefix */
     int n = 0;
     if (add_bos && n < max_tokens)
         tokens[n++] = tok->bos_id;
+    for (int i = 0; i < n_work && n < max_tokens; i++)
+        tokens[n++] = work[i];
 
-    /* Greedy longest-match initial tokenization */
-    for (const char* p = text; *p && n < max_tokens; ) {
-        int best_id = -1, best_len = 0;
-        int rem = (int)strlen(p);
-        int try_max = tok->max_token_len;
-        if (try_max > rem) try_max = rem;
-        for (int tl = try_max; tl >= 1; tl--) {
-            int id = tok_lookup(tok, p, tl);
-            if (id != -1) { best_id = id; best_len = tl; break; }
-        }
-        if (best_id != -1) { tokens[n++] = best_id; p += best_len; }
-        else p++;  /* skip unknown byte */
-    }
-
-    /* BPE merge pass */
-    while (n >= 2) {
-        float best_score = -1e30f;
-        int best_idx = -1, best_id = -1;
-        for (int i = 0; i < n - 1; i++) {
-            char merged[512];
-            int l1 = (int)strlen(tok->vocab[tokens[i]]);
-            int l2 = (int)strlen(tok->vocab[tokens[i + 1]]);
-            if (l1 + l2 >= (int)sizeof(merged)) continue;
-            memcpy(merged, tok->vocab[tokens[i]], l1);
-            memcpy(merged + l1, tok->vocab[tokens[i + 1]], l2);
-            int id = tok_lookup(tok, merged, l1 + l2);
-            if (id != -1 && tok->scores[id] > best_score) {
-                best_score = tok->scores[id];
-                best_idx = i;
-                best_id = id;
-            }
-        }
-        if (best_idx == -1) break;
-        tokens[best_idx] = best_id;
-        for (int i = best_idx + 1; i < n - 1; i++)
-            tokens[i] = tokens[i + 1];
-        n--;
-    }
+    free(work);
     return n;
 }
 
+/* Decode token ID to raw text.
+ * Reverses the GPT-2 byte-to-unicode mapping:
+ *   Ġ (U+0120) → space, Ċ (U+010A) → newline, etc.
+ * All codepoints in U+0100..U+0143 are looked up in BPE_N2B. */
 const char* bt_decode(const bt_tokenizer_t* tok, int prev_token, int token) {
     static char buf[1024];
     if (token < 0 || token >= tok->vocab_size) return "";
-    const char* src = tok->vocab[token];
+    const unsigned char* src = (const unsigned char*)tok->vocab[token];
 
-    /* GPT-2 BPE: Ġ (U+0120 = 0xC4 0xA0) represents a leading space.
-     * Replace all Ġ occurrences with actual spaces. */
     int j = 0;
-    for (int i = 0; src[i] && j < (int)sizeof(buf) - 1; ) {
-        if ((uint8_t)src[i] == 0xC4 && (uint8_t)src[i+1] == 0xA0) {
-            buf[j++] = ' ';
-            i += 2;
-        } else if ((uint8_t)src[i] == 0xC4 && (uint8_t)src[i+1] == 0x8A) {
-            /* Ċ (U+010A = 0xC4 0x8A) represents newline in GPT-2 BPE */
-            buf[j++] = '\n';
-            i += 2;
+    while (*src && j < (int)sizeof(buf) - 4) {
+        if (src[0] < 0x80) {
+            /* ASCII: identity mapping */
+            buf[j++] = (char)src[0];
+            src++;
+        } else if ((src[0] & 0xE0) == 0xC0 && (src[1] & 0xC0) == 0x80) {
+            /* 2-byte UTF-8: decode codepoint */
+            int cp = ((src[0] & 0x1F) << 6) | (src[1] & 0x3F);
+            if (cp >= 0x100 && cp <= 0x143) {
+                /* BPE remapped byte: look up raw value */
+                buf[j++] = (char)BPE_N2B[cp - 0x100];
+            } else if ((cp >= 0xA1 && cp <= 0xAC) || (cp >= 0xAE && cp <= 0xFF)) {
+                /* Latin-1 identity: output as raw byte */
+                buf[j++] = (char)cp;
+            } else {
+                /* Other 2-byte codepoint: pass through as UTF-8 */
+                buf[j++] = (char)src[0];
+                buf[j++] = (char)src[1];
+            }
+            src += 2;
         } else {
-            buf[j++] = src[i++];
+            /* 3+ byte UTF-8: pass through */
+            buf[j++] = (char)*src++;
         }
     }
     buf[j] = '\0';
@@ -904,6 +1013,12 @@ int bt_load_model(bt_model_t* model, const char* path) {
             }
         }
 
+        /* Build sorted vocab index for O(log V) binary search */
+        tok->sorted_idx = (int*)bt_calloc(tok->vocab_size, sizeof(int));
+        for (int i = 0; i < tok->vocab_size; i++) tok->sorted_idx[i] = i;
+        bt_sort_vocab_global = tok->vocab;
+        qsort(tok->sorted_idx, tok->vocab_size, sizeof(int), bt_sort_vocab_cmp);
+
         fprintf(stderr, "biturbo: tokenizer: %d tokens, max_len=%d, "
                 "bos=%d eos=%d\n",
                 tok->vocab_size, tok->max_token_len, tok->bos_id, tok->eos_id);
@@ -1041,6 +1156,7 @@ void bt_free_model(bt_model_t* model) {
         free(tok->vocab);
     }
     free(tok->scores);
+    free(tok->sorted_idx);
 
     /* Unmap */
     if (model->mmap_data && model->mmap_data != MAP_FAILED)
