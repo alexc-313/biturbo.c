@@ -36,6 +36,10 @@
 #include <arm_neon.h>
 #endif
 
+#ifdef BT_FPGA
+#include "biturbo_fpga.h"
+#endif
+
 /* ================================================================
  * VOCAB SORT HELPER (for building binary search index)
  * ================================================================ */
@@ -203,15 +207,38 @@ static void rms_norm(float* out, const float* x, const float* weight,
     int i = 0;
     for (; i + 3 < size; i += 4) {
         float32x4_t v = vld1q_f32(x + i);
+#ifdef __aarch64__
         acc = vfmaq_f32(acc, v, v);
+#else
+        acc = vmlaq_f32(acc, v, v);
+#endif
     }
+#ifdef __aarch64__
     ss = vaddvq_f32(acc);
+#else
+    float32x2_t sum2 = vadd_f32(vget_low_f32(acc), vget_high_f32(acc));
+    sum2 = vpadd_f32(sum2, sum2);
+    ss = vget_lane_f32(sum2, 0);
+#endif
     for (; i < size; i++) ss += x[i] * x[i];
 #else
     for (int i = 0; i < size; i++) ss += x[i] * x[i];
 #endif
     float scale = 1.0f / sqrtf(ss / (float)size + eps);
+#ifdef __ARM_NEON
+    {
+        float32x4_t vs = vdupq_n_f32(scale);
+        int i = 0;
+        for (; i + 3 < size; i += 4) {
+            float32x4_t vx = vld1q_f32(x + i);
+            float32x4_t vw = vld1q_f32(weight + i);
+            vst1q_f32(out + i, vmulq_f32(vmulq_f32(vx, vs), vw));
+        }
+        for (; i < size; i++) out[i] = x[i] * scale * weight[i];
+    }
+#else
     for (int i = 0; i < size; i++) out[i] = x[i] * scale * weight[i];
+#endif
 }
 
 /* ================================================================
@@ -223,18 +250,74 @@ static void rms_norm(float* out, const float* x, const float* weight,
 
 static float bitlinear_quantize(int8_t* out, const float* x, int size) {
     float amax = 0.0f;
+#ifdef __ARM_NEON
+    {
+        float32x4_t vmax = vdupq_n_f32(0.0f);
+        int i = 0;
+        for (; i + 3 < size; i += 4) {
+            float32x4_t v = vld1q_f32(x + i);
+            vmax = vmaxq_f32(vmax, vabsq_f32(v));
+        }
+        /* Horizontal max */
+        float32x2_t m2 = vpmax_f32(vget_low_f32(vmax), vget_high_f32(vmax));
+        m2 = vpmax_f32(m2, m2);
+        amax = vget_lane_f32(m2, 0);
+        for (; i < size; i++) {
+            float a = fabsf(x[i]);
+            if (a > amax) amax = a;
+        }
+    }
+#else
     for (int i = 0; i < size; i++) {
         float a = fabsf(x[i]);
         if (a > amax) amax = a;
     }
+#endif
     if (amax < 1e-10f) amax = 1e-10f;
     float scale = 127.0f / amax;
+#ifdef __ARM_NEON
+    {
+        float32x4_t vscale = vdupq_n_f32(scale);
+        float32x4_t vhalf  = vdupq_n_f32(0.5f);
+        float32x4_t vnhalf = vdupq_n_f32(-0.5f);
+        int32x4_t   vmax_i = vdupq_n_s32(127);
+        int32x4_t   vmin_i = vdupq_n_s32(-128);
+        int i = 0;
+        for (; i + 7 < size; i += 8) {
+            /* Process 8 elements → 8 int8 outputs */
+            float32x4_t v0 = vmulq_f32(vld1q_f32(x + i), vscale);
+            float32x4_t v1 = vmulq_f32(vld1q_f32(x + i + 4), vscale);
+            /* Round: add ±0.5 then truncate */
+            float32x4_t r0 = vaddq_f32(v0, vbslq_f32(vcltq_f32(v0, vdupq_n_f32(0.0f)),
+                                        vnhalf, vhalf));
+            float32x4_t r1 = vaddq_f32(v1, vbslq_f32(vcltq_f32(v1, vdupq_n_f32(0.0f)),
+                                        vnhalf, vhalf));
+            int32x4_t i0 = vcvtq_s32_f32(r0);
+            int32x4_t i1 = vcvtq_s32_f32(r1);
+            /* Clamp to [-128, 127] */
+            i0 = vminq_s32(vmaxq_s32(i0, vmin_i), vmax_i);
+            i1 = vminq_s32(vmaxq_s32(i1, vmin_i), vmax_i);
+            /* Narrow: 32→16→8 */
+            int16x4_t s0 = vmovn_s32(i0);
+            int16x4_t s1 = vmovn_s32(i1);
+            int8x8_t  b  = vmovn_s16(vcombine_s16(s0, s1));
+            vst1_s8(out + i, b);
+        }
+        for (; i < size; i++) {
+            int v = (int)roundf(x[i] * scale);
+            if (v > 127) v = 127;
+            if (v < -128) v = -128;
+            out[i] = (int8_t)v;
+        }
+    }
+#else
     for (int i = 0; i < size; i++) {
         int v = (int)roundf(x[i] * scale);
         if (v > 127) v = 127;
         if (v < -128) v = -128;
         out[i] = (int8_t)v;
     }
+#endif
     return amax / 127.0f;  /* inv_scale */
 }
 
@@ -576,7 +659,18 @@ static int tq_random_sign(uint32_t seed, int idx) {
 static void tq_walsh_hadamard(float* data, int n) {
     for (int len = 1; len < n; len <<= 1) {
         for (int i = 0; i < n; i += len << 1) {
+#ifdef __ARM_NEON
+            int j = 0;
+            for (; j + 3 < len; j += 4) {
+                float32x4_t u = vld1q_f32(data + i + j);
+                float32x4_t v = vld1q_f32(data + i + j + len);
+                vst1q_f32(data + i + j,       vaddq_f32(u, v));
+                vst1q_f32(data + i + j + len, vsubq_f32(u, v));
+            }
+            for (; j < len; j++) {
+#else
             for (int j = 0; j < len; j++) {
+#endif
                 float u = data[i + j];
                 float v = data[i + j + len];
                 data[i + j]       = u + v;
@@ -826,6 +920,15 @@ void bt_forward(bt_model_t* model, int token, int pos) {
 
         /* Stage 4-6-7: Q/K/V projections (BitLinear + T-MAC) */
         float inv_scale = bitlinear_quantize(s->q8_buf, s->xb, dim);
+#ifdef BT_FPGA
+        if (bt_fpga_regs) {
+            bt_fpga_load_layer(model, l);
+            bt_fpga_upload_activations(s->q8_buf, dim);
+            bt_fpga_gemv_dequant(s->q, lw->wq.tmac, &bt_fpga_layer_locs[l].wq, inv_scale);
+            bt_fpga_gemv_dequant(s->k, lw->wk.tmac, &bt_fpga_layer_locs[l].wk, inv_scale);
+            bt_fpga_gemv_dequant(s->v, lw->wv.tmac, &bt_fpga_layer_locs[l].wv, inv_scale);
+        } else
+#endif
         {
             bt_tmac_weight_t* tw = lw->wq.tmac;
             tmac_build_three_lut(s->lut_buf, s->q8_buf, tw->n3);
@@ -886,6 +989,13 @@ void bt_forward(bt_model_t* model, int token, int pos) {
 
         /* Stage 11: Attention sub-norm + output projection */
         rms_norm(s->xb, s->xb2, lw->attn_sub_norm, dim, cfg->norm_eps);
+#ifdef BT_FPGA
+        if (bt_fpga_regs) {
+            inv_scale = bitlinear_quantize(s->q8_buf, s->xb, dim);
+            bt_fpga_upload_activations(s->q8_buf, dim);
+            bt_fpga_gemv_dequant(s->xb2, lw->wo.tmac, &bt_fpga_layer_locs[l].wo, inv_scale);
+        } else
+#endif
         tmac_forward(s->xb2, s->xb, s->q8_buf, s->lut_buf, &lw->wo);
 
         /* Residual */
@@ -894,6 +1004,13 @@ void bt_forward(bt_model_t* model, int token, int pos) {
         /* Stage 12: FFN pre-norm + gate/up projections */
         rms_norm(s->xb, s->x, lw->ffn_norm, dim, cfg->norm_eps);
         inv_scale = bitlinear_quantize(s->q8_buf, s->xb, dim);
+#ifdef BT_FPGA
+        if (bt_fpga_regs) {
+            bt_fpga_upload_activations(s->q8_buf, dim);
+            bt_fpga_gemv_dequant(s->hb, lw->w_gate.tmac, &bt_fpga_layer_locs[l].w_gate, inv_scale);
+            bt_fpga_gemv_dequant(s->hb2, lw->w_up.tmac, &bt_fpga_layer_locs[l].w_up, inv_scale);
+        } else
+#endif
         {
             bt_tmac_weight_t* tw = lw->w_gate.tmac;
             tmac_build_three_lut(s->lut_buf, s->q8_buf, tw->n3);
@@ -904,14 +1021,39 @@ void bt_forward(bt_model_t* model, int token, int pos) {
         }
 
         /* SqReLU gating: hidden = SqReLU(gate) * up */
+#ifdef __ARM_NEON
+        {
+            float32x4_t zero = vdupq_n_f32(0.0f);
+            int i = 0;
+            for (; i + 3 < ffn_dim; i += 4) {
+                float32x4_t g = vld1q_f32(s->hb + i);
+                float32x4_t u = vld1q_f32(s->hb2 + i);
+                float32x4_t r = vmaxq_f32(g, zero);
+                vst1q_f32(s->hb + i, vmulq_f32(vmulq_f32(r, r), u));
+            }
+            for (; i < ffn_dim; i++) {
+                float g = s->hb[i];
+                float r = (g > 0.0f) ? g : 0.0f;
+                s->hb[i] = r * r * s->hb2[i];
+            }
+        }
+#else
         for (int i = 0; i < ffn_dim; i++) {
             float g = s->hb[i];
             float r = (g > 0.0f) ? g : 0.0f;
             s->hb[i] = r * r * s->hb2[i];
         }
+#endif
 
         /* Stage 13: FFN sub-norm + down projection */
         rms_norm(s->hb2, s->hb, lw->ffn_sub_norm, ffn_dim, cfg->norm_eps);
+#ifdef BT_FPGA
+        if (bt_fpga_regs) {
+            inv_scale = bitlinear_quantize(s->q8_buf, s->hb2, ffn_dim);
+            bt_fpga_upload_activations(s->q8_buf, ffn_dim);
+            bt_fpga_gemv_dequant(s->xb, lw->w_down.tmac, &bt_fpga_layer_locs[l].w_down, inv_scale);
+        } else
+#endif
         tmac_forward(s->xb, s->hb2, s->q8_buf, s->lut_buf, &lw->w_down);
 
         /* Residual */
@@ -923,6 +1065,51 @@ void bt_forward(bt_model_t* model, int token, int pos) {
 
     /* LM head: logits[v] = dot(xb, token_embd[v]) for all vocab
      * token_embd is F16 [vocab_size][dim] */
+#ifdef __ARM_NEON
+    {
+        /* NEON F16→F32 conversion via integer bit manipulation (ARMv7-safe).
+         * Process 4 F16 values at a time, fused with multiply-accumulate. */
+        uint32x4_t exp_bias = vdupq_n_u32(112);  /* 127 - 15 */
+        uint32x4_t mant_mask = vdupq_n_u32(0x3FF);
+        uint32x4_t exp_mask  = vdupq_n_u32(0x1F);
+        uint32x4_t sign_mask = vdupq_n_u32(0x80000000);
+        uint32x4_t zero_u32  = vdupq_n_u32(0);
+
+        for (int v = 0; v < cfg->vocab_size; v++) {
+            const uint16_t* ev = w->token_embedding + (size_t)v * dim;
+            float32x4_t acc = vdupq_n_f32(0.0f);
+            int d = 0;
+            for (; d + 3 < dim; d += 4) {
+                /* Load 4 x F16, convert to F32 */
+                uint16x4_t h = vld1_u16(ev + d);
+                uint32x4_t h32 = vmovl_u16(h);
+                uint32x4_t sign = vandq_u32(vshlq_n_u32(h32, 16), sign_mask);
+                uint32x4_t exp  = vandq_u32(vshrq_n_u32(h32, 10), exp_mask);
+                uint32x4_t mant = vandq_u32(h32, mant_mask);
+                uint32x4_t f32  = vorrq_u32(sign,
+                    vorrq_u32(vshlq_n_u32(vaddq_u32(exp, exp_bias), 23),
+                              vshlq_n_u32(mant, 13)));
+                /* Zero out denormals (exp==0) */
+                f32 = vbicq_u32(f32, vceqq_u32(exp, zero_u32));
+                float32x4_t val = vreinterpretq_f32_u32(f32);
+                /* Multiply-accumulate with xb */
+                float32x4_t xv = vld1q_f32(s->xb + d);
+#ifdef __aarch64__
+                acc = vfmaq_f32(acc, xv, val);
+#else
+                acc = vmlaq_f32(acc, xv, val);
+#endif
+            }
+            /* Horizontal sum */
+            float32x2_t s2 = vadd_f32(vget_low_f32(acc), vget_high_f32(acc));
+            s2 = vpadd_f32(s2, s2);
+            float sum = vget_lane_f32(s2, 0);
+            for (; d < dim; d++)
+                sum += s->xb[d] * bt_f16_to_f32(ev[d]);
+            s->logits[v] = sum;
+        }
+    }
+#else
     for (int v = 0; v < cfg->vocab_size; v++) {
         const uint16_t* ev = w->token_embedding + (size_t)v * dim;
         float sum = 0.0f;
@@ -930,6 +1117,7 @@ void bt_forward(bt_model_t* model, int token, int pos) {
             sum += s->xb[d] * bt_f16_to_f32(ev[d]);
         s->logits[v] = sum;
     }
+#endif
 }
 
 /* ================================================================
@@ -1533,6 +1721,24 @@ int bt_load_model(bt_model_t* model, const char* path) {
     fprintf(stderr, "biturbo: T-MAC TL2 weights repacked (%d layers)\n",
             cfg->n_layers);
 
+#ifdef BT_FPGA
+    {
+        uint32_t ddr3_base = 0x30000000;
+        uint32_t ddr3_span = 0x02000000;  /* 32 MB default */
+        const char *s;
+        if ((s = getenv("BT_FPGA_DDR3_BASE")) != NULL)
+            ddr3_base = (uint32_t)strtoul(s, NULL, 0);
+        if ((s = getenv("BT_FPGA_DDR3_SPAN")) != NULL)
+            ddr3_span = (uint32_t)strtoul(s, NULL, 0);
+        if (bt_fpga_init(ddr3_base, ddr3_span) == 0) {
+            bt_fpga_prepare_layout(model);
+            fprintf(stderr, "biturbo: FPGA T-MAC accelerator ready\n");
+        } else {
+            fprintf(stderr, "biturbo: FPGA init failed, using CPU path\n");
+        }
+    }
+#endif
+
     fprintf(stderr, "biturbo: model loaded (%.1f MB mmap'd)\n",
             (double)model->mmap_size / (1024 * 1024));
     return 0;
@@ -1544,6 +1750,10 @@ fail:
 }
 
 void bt_free_model(bt_model_t* model) {
+#ifdef BT_FPGA
+    if (bt_fpga_regs)
+        bt_fpga_cleanup();
+#endif
     /* Free allocated weight copies (F32 norms) */
     bt_weights_t* wt = &model->weights;
     if (wt->layers) {
