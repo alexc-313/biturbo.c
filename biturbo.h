@@ -155,7 +155,7 @@ typedef struct {
  * ============================================================ */
 
 typedef struct {
-    const uint16_t* token_embedding;  /* [vocab_size, dim] F16 (mmap'd) */
+    const uint8_t* token_embedding;   /* [vocab_size, dim] Q6_K (mmap'd) */
     bt_layer_weights_t* layers;       /* [n_layers]                     */
     float* final_norm;                /* [dim] output RMS norm          */
     /* lm_head: tied to token_embedding (transposed)                    */

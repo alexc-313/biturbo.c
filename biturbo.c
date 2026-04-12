@@ -92,7 +92,46 @@ static void* bt_calloc(size_t count, size_t size) {
 /* GGUF tensor types */
 #define GGUF_TENSOR_F32  0
 #define GGUF_TENSOR_F16  1
+#define GGUF_TENSOR_Q6K  14
 #define GGUF_TENSOR_I2S  36
+
+/* Q6_K block: 256 elements in ~210 bytes (6.5625 bits/weight) */
+#define BT_QK_K 256
+
+typedef struct {
+    uint8_t ql[BT_QK_K/2];      /* 128 bytes: lower 4 bits of quants */
+    uint8_t qh[BT_QK_K/4];      /*  64 bytes: upper 2 bits of quants */
+    int8_t  scales[BT_QK_K/16]; /*  16 bytes: per-sub-block scales   */
+    uint16_t d;                  /*   2 bytes: super-block scale (F16)*/
+} bt_block_q6k_t;
+
+/* Dequantize one row of Q6_K blocks into float */
+static void dequantize_q6k(const bt_block_q6k_t* x, float* y, int k) {
+    int nb = k / BT_QK_K;
+    for (int i = 0; i < nb; i++) {
+        float d = bt_f16_to_f32(x[i].d);
+        const uint8_t* ql = x[i].ql;
+        const uint8_t* qh = x[i].qh;
+        const int8_t*  sc = x[i].scales;
+        for (int n = 0; n < BT_QK_K; n += 128) {
+            for (int l = 0; l < 32; ++l) {
+                int is = l / 16;
+                int8_t q1 = (int8_t)((ql[l+ 0] & 0xF) | (((qh[l]>>0)&3)<<4)) - 32;
+                int8_t q2 = (int8_t)((ql[l+32] & 0xF) | (((qh[l]>>2)&3)<<4)) - 32;
+                int8_t q3 = (int8_t)((ql[l+ 0]  >> 4) | (((qh[l]>>4)&3)<<4)) - 32;
+                int8_t q4 = (int8_t)((ql[l+32]  >> 4) | (((qh[l]>>6)&3)<<4)) - 32;
+                y[l+ 0] = d * sc[is+0] * q1;
+                y[l+32] = d * sc[is+2] * q2;
+                y[l+64] = d * sc[is+4] * q3;
+                y[l+96] = d * sc[is+6] * q4;
+            }
+            y  += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+}
 
 typedef struct {
     const uint8_t* base;
@@ -905,10 +944,13 @@ void bt_forward(bt_model_t* model, int token, int pos) {
     int gqa_groups = BT_GQA_GROUPS(cfg);
     int ffn_dim = cfg->ffn_dim;
 
-    /* ── Stage 2: Token embedding (F16 → F32) ── */
-    const uint16_t* emb = w->token_embedding + (size_t)token * dim;
-    for (int i = 0; i < dim; i++)
-        s->x[i] = bt_f16_to_f32(emb[i]);
+    /* ── Stage 2: Token embedding (Q6_K → F32) ── */
+    {
+        int nb_per_row = dim / BT_QK_K;
+        size_t row_bytes = (size_t)nb_per_row * sizeof(bt_block_q6k_t);
+        const bt_block_q6k_t* emb = (const bt_block_q6k_t*)(w->token_embedding + (size_t)token * row_bytes);
+        dequantize_q6k(emb, s->x, dim);
+    }
 
     /* ── Transformer layers ── */
     for (int l = 0; l < cfg->n_layers; l++) {
@@ -1064,60 +1106,43 @@ void bt_forward(bt_model_t* model, int token, int pos) {
     rms_norm(s->xb, s->x, w->final_norm, dim, cfg->norm_eps);
 
     /* LM head: logits[v] = dot(xb, token_embd[v]) for all vocab
-     * token_embd is F16 [vocab_size][dim] */
-#ifdef __ARM_NEON
+     * token_embd is Q6_K [vocab_size][dim] */
     {
-        /* NEON F16→F32 conversion via integer bit manipulation (ARMv7-safe).
-         * Process 4 F16 values at a time, fused with multiply-accumulate. */
-        uint32x4_t exp_bias = vdupq_n_u32(112);  /* 127 - 15 */
-        uint32x4_t mant_mask = vdupq_n_u32(0x3FF);
-        uint32x4_t exp_mask  = vdupq_n_u32(0x1F);
-        uint32x4_t sign_mask = vdupq_n_u32(0x80000000);
-        uint32x4_t zero_u32  = vdupq_n_u32(0);
-
+        int nb_per_row = dim / BT_QK_K;
+        size_t row_bytes = (size_t)nb_per_row * sizeof(bt_block_q6k_t);
+        float* tmp = s->xb2;  /* reuse scratch buffer (>= dim floats) */
         for (int v = 0; v < cfg->vocab_size; v++) {
-            const uint16_t* ev = w->token_embedding + (size_t)v * dim;
+            const bt_block_q6k_t* ev = (const bt_block_q6k_t*)(w->token_embedding + (size_t)v * row_bytes);
+            dequantize_q6k(ev, tmp, dim);
+            float sum = 0.0f;
+#ifdef __ARM_NEON
             float32x4_t acc = vdupq_n_f32(0.0f);
             int d = 0;
             for (; d + 3 < dim; d += 4) {
-                /* Load 4 x F16, convert to F32 */
-                uint16x4_t h = vld1_u16(ev + d);
-                uint32x4_t h32 = vmovl_u16(h);
-                uint32x4_t sign = vandq_u32(vshlq_n_u32(h32, 16), sign_mask);
-                uint32x4_t exp  = vandq_u32(vshrq_n_u32(h32, 10), exp_mask);
-                uint32x4_t mant = vandq_u32(h32, mant_mask);
-                uint32x4_t f32  = vorrq_u32(sign,
-                    vorrq_u32(vshlq_n_u32(vaddq_u32(exp, exp_bias), 23),
-                              vshlq_n_u32(mant, 13)));
-                /* Zero out denormals (exp==0) */
-                f32 = vbicq_u32(f32, vceqq_u32(exp, zero_u32));
-                float32x4_t val = vreinterpretq_f32_u32(f32);
-                /* Multiply-accumulate with xb */
                 float32x4_t xv = vld1q_f32(s->xb + d);
+                float32x4_t tv = vld1q_f32(tmp + d);
 #ifdef __aarch64__
-                acc = vfmaq_f32(acc, xv, val);
+                acc = vfmaq_f32(acc, xv, tv);
 #else
-                acc = vmlaq_f32(acc, xv, val);
+                acc = vmlaq_f32(acc, xv, tv);
 #endif
             }
-            /* Horizontal sum */
-            float32x2_t s2 = vadd_f32(vget_low_f32(acc), vget_high_f32(acc));
-            s2 = vpadd_f32(s2, s2);
-            float sum = vget_lane_f32(s2, 0);
-            for (; d < dim; d++)
-                sum += s->xb[d] * bt_f16_to_f32(ev[d]);
+#ifdef __aarch64__
+            sum = vaddvq_f32(acc);
+#else
+            {
+                float32x2_t s2 = vadd_f32(vget_low_f32(acc), vget_high_f32(acc));
+                s2 = vpadd_f32(s2, s2);
+                sum = vget_lane_f32(s2, 0);
+            }
+#endif
+            for (; d < dim; d++) sum += s->xb[d] * tmp[d];
+#else
+            for (int d = 0; d < dim; d++) sum += s->xb[d] * tmp[d];
+#endif
             s->logits[v] = sum;
         }
     }
-#else
-    for (int v = 0; v < cfg->vocab_size; v++) {
-        const uint16_t* ev = w->token_embedding + (size_t)v * dim;
-        float sum = 0.0f;
-        for (int d = 0; d < dim; d++)
-            sum += s->xb[d] * bt_f16_to_f32(ev[d]);
-        s->logits[v] = sum;
-    }
-#endif
 }
 
 /* ================================================================
@@ -1647,10 +1672,10 @@ int bt_load_model(bt_model_t* model, const char* path) {
     bt_weights_t* wt = &model->weights;
     int n_t = (int)n_tensors;
 
-    /* Token embedding (F16, mmap'd directly) */
+    /* Token embedding (Q6_K, mmap'd directly) */
     const gguf_tensor_info_t* te = find_tensor(tensors, n_t, "token_embd.weight");
     if (!te) { fprintf(stderr, "biturbo: missing token_embd.weight\n"); goto fail; }
-    wt->token_embedding = (const uint16_t*)(data_base + te->offset);
+    wt->token_embedding = (const uint8_t*)(data_base + te->offset);
 
     /* Final norm */
     const gguf_tensor_info_t* fn = find_tensor(tensors, n_t, "output_norm.weight");
