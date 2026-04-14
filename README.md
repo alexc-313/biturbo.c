@@ -91,6 +91,30 @@ python BitNet/utils/convert-ms-to-gguf-bitnet.py model-bf16/ --outtype i2_s
 ./biturbo model/ggml-model-i2_s.gguf -p "Explain quantum computing" -n 256 -t 0.0
 ```
 
+## DE10-Nano FPGA memory carveout
+
+When building `biturbo_fpga` for the DE10-Nano, the FPGA driver expects a
+reserved DDR3 window outside Linux's normal page allocator. The default
+carveout is the top 32 MB of HPS DDR:
+
+```text
+base = 0x3E000000
+span = 0x02000000
+```
+
+The matching `reserved-memory` node lives in [`soc_system.dts`](../soc_system.dts).
+After changing the device tree, rebuild/copy the DTB that your board actually
+boots, then verify on target:
+
+```bash
+ls /proc/device-tree/reserved-memory/
+hexdump -Cv /proc/device-tree/reserved-memory/biturbo-fpga@3e000000/reg
+grep -i -A3 -B1 3e000000 /proc/iomem
+```
+
+If the board is still booting an older DTB, `biturbo_fpga` may fall back to a
+raw `/dev/mem` mapping and the FPGA can end up DMA-ing into Linux-owned RAM.
+
 ### Options
 
 | Flag | Default | Description |

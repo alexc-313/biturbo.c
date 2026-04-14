@@ -1748,14 +1748,17 @@ int bt_load_model(bt_model_t* model, const char* path) {
 
 #ifdef BT_FPGA
     {
-        uint32_t ddr3_base = 0x30000000;
+        uint32_t ddr3_base = 0x3E000000;
+        uint32_t ddr3_avm_base = 0x3E000000;
         uint32_t ddr3_span = 0x02000000;  /* 32 MB default */
         const char *s;
         if ((s = getenv("BT_FPGA_DDR3_BASE")) != NULL)
             ddr3_base = (uint32_t)strtoul(s, NULL, 0);
+        if ((s = getenv("BT_FPGA_DDR3_AVM_BASE")) != NULL)
+            ddr3_avm_base = (uint32_t)strtoul(s, NULL, 0);
         if ((s = getenv("BT_FPGA_DDR3_SPAN")) != NULL)
             ddr3_span = (uint32_t)strtoul(s, NULL, 0);
-        if (bt_fpga_init(ddr3_base, ddr3_span) == 0) {
+        if (bt_fpga_init(ddr3_base, ddr3_avm_base, ddr3_span) == 0) {
             bt_fpga_prepare_layout(model);
             fprintf(stderr, "biturbo: FPGA T-MAC accelerator ready\n");
         } else {

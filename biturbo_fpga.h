@@ -58,7 +58,8 @@
 static int               bt_fpga_fd = -1;
 static volatile uint32_t *bt_fpga_regs = NULL;
 static volatile uint8_t  *bt_fpga_ddr3 = NULL;
-static uint32_t          bt_fpga_ddr3_phys = 0;
+static uint32_t          bt_fpga_ddr3_cpu_phys = 0;
+static uint32_t          bt_fpga_ddr3_avm_base = 0;
 static uint32_t          bt_fpga_ddr3_span = 0;
 static uint32_t          bt_fpga_act_off = 0;
 static uint32_t          bt_fpga_res_off = 0;
@@ -98,7 +99,9 @@ static inline uint32_t bt_fpga_reg_read(uint32_t offset) {
  * Init / Cleanup
  * ================================================================ */
 
-static int bt_fpga_init(uint32_t ddr3_base, uint32_t ddr3_span) {
+static int bt_fpga_init(uint32_t ddr3_cpu_phys,
+                        uint32_t ddr3_avm_base,
+                        uint32_t ddr3_span) {
     bt_fpga_fd = open("/dev/mem", O_RDWR | O_SYNC);
     if (bt_fpga_fd < 0) {
         perror("bt_fpga_init: open /dev/mem");
@@ -117,7 +120,7 @@ static int bt_fpga_init(uint32_t ddr3_base, uint32_t ddr3_span) {
 
     bt_fpga_ddr3 = (volatile uint8_t *)mmap(NULL, ddr3_span,
                     PROT_READ | PROT_WRITE, MAP_SHARED,
-                    bt_fpga_fd, ddr3_base);
+                    bt_fpga_fd, ddr3_cpu_phys);
     if (bt_fpga_ddr3 == MAP_FAILED) {
         perror("bt_fpga_init: mmap ddr3");
         munmap((void *)lw, BT_FPGA_LW_BRIDGE_SPAN);
@@ -125,12 +128,14 @@ static int bt_fpga_init(uint32_t ddr3_base, uint32_t ddr3_span) {
         return -1;
     }
 
-    bt_fpga_ddr3_phys = ddr3_base;
+    bt_fpga_ddr3_cpu_phys = ddr3_cpu_phys;
+    bt_fpga_ddr3_avm_base = ddr3_avm_base;
     bt_fpga_ddr3_span = ddr3_span;
     bt_fpga_cached_layer = -1;
 
-    fprintf(stderr, "[FPGA] T-MAC accelerator bound: DDR3 0x%08X span 0x%X\n",
-            ddr3_base, ddr3_span);
+    fprintf(stderr,
+            "[FPGA] T-MAC accelerator bound: CPU DDR3 0x%08X, AVM base 0x%08X, span 0x%X\n",
+            ddr3_cpu_phys, ddr3_avm_base, ddr3_span);
     return 0;
 }
 
@@ -332,6 +337,7 @@ static void bt_fpga_repack_to_ddr3(const bt_tmac_weight_t *tw,
             sign_out[byte_off] |= (uint8_t)(1 << (eng & 7));
         }
     }
+    fprintf(stderr, "[FPGA] repack %d\n", rows);
 }
 
 /* ================================================================
@@ -357,6 +363,7 @@ static void bt_fpga_load_layer(bt_model_t *model, int layer) {
         bt_fpga_repack_to_ddr3(wts[i], locs[i]);
 
     bt_fpga_cached_layer = layer;
+    fprintf(stderr, "[FPGA] loading layer %d\n", layer);
 }
 
 /* ================================================================
@@ -383,10 +390,10 @@ static void bt_fpga_gemv(const bt_tmac_weight_t *tw,
     int M = tw->rows;
     int K = ((tw->cols + 2) / 3) * 3;
 
-    uint32_t nib_phys = bt_fpga_ddr3_phys + loc->nib_off;
-    uint32_t sign_phys = bt_fpga_ddr3_phys + loc->sign_off;
-    uint32_t act_phys = bt_fpga_ddr3_phys + bt_fpga_act_off;
-    uint32_t res_phys = bt_fpga_ddr3_phys + bt_fpga_res_off;
+    uint32_t nib_phys = bt_fpga_ddr3_avm_base + loc->nib_off;
+    uint32_t sign_phys = bt_fpga_ddr3_avm_base + loc->sign_off;
+    uint32_t act_phys = bt_fpga_ddr3_avm_base + bt_fpga_act_off;
+    uint32_t res_phys = bt_fpga_ddr3_avm_base + bt_fpga_res_off;
 
     int rows_done = 0;
     while (rows_done < M) {
@@ -400,10 +407,10 @@ static void bt_fpga_gemv(const bt_tmac_weight_t *tw,
         /* Debug: dump registers before first GEMV */
         if (bt_fpga_gemv_count == 0) {
             fprintf(stderr, "[FPGA] first GEMV: M=%d K=%d\n", M, K);
-            fprintf(stderr, "  NIB_BASE  =0x%08X\n", tile_nib);
-            fprintf(stderr, "  SIGN_BASE =0x%08X\n", tile_sign);
-            fprintf(stderr, "  ACT_BASE  =0x%08X\n", act_phys);
-            fprintf(stderr, "  RES_BASE  =0x%08X\n", res_phys);
+            fprintf(stderr, "  NIB_BASE  =0x%08X (AVM)\n", tile_nib);
+            fprintf(stderr, "  SIGN_BASE =0x%08X (AVM)\n", tile_sign);
+            fprintf(stderr, "  ACT_BASE  =0x%08X (AVM)\n", act_phys);
+            fprintf(stderr, "  RES_BASE  =0x%08X (AVM)\n", res_phys);
             fprintf(stderr, "  STATUS before START=0x%08X\n",
                     bt_fpga_reg_read(BT_REG_STATUS));
         }
