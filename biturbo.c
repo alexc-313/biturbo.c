@@ -21,6 +21,7 @@
  */
 
 #include "biturbo.h"
+#include "biturbo_btpk.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -966,9 +967,16 @@ void bt_forward(bt_model_t* model, int token, int pos) {
         if (bt_fpga_regs) {
             bt_fpga_load_layer(model, l);
             bt_fpga_upload_activations(s->q8_buf, dim);
-            bt_fpga_gemv_dequant(s->q, lw->wq.tmac, &bt_fpga_layer_locs[l].wq, inv_scale);
-            bt_fpga_gemv_dequant(s->k, lw->wk.tmac, &bt_fpga_layer_locs[l].wk, inv_scale);
-            bt_fpga_gemv_dequant(s->v, lw->wv.tmac, &bt_fpga_layer_locs[l].wv, inv_scale);
+            if (model->btpk) {
+                btpk_layer_t* bl = &model->btpk->layers[l];
+                bt_fpga_gemv_dequant_btpk(s->q, &bl->wq, &bt_fpga_layer_locs[l].wq, inv_scale);
+                bt_fpga_gemv_dequant_btpk(s->k, &bl->wk, &bt_fpga_layer_locs[l].wk, inv_scale);
+                bt_fpga_gemv_dequant_btpk(s->v, &bl->wv, &bt_fpga_layer_locs[l].wv, inv_scale);
+            } else {
+                bt_fpga_gemv_dequant(s->q, lw->wq.tmac, &bt_fpga_layer_locs[l].wq, inv_scale);
+                bt_fpga_gemv_dequant(s->k, lw->wk.tmac, &bt_fpga_layer_locs[l].wk, inv_scale);
+                bt_fpga_gemv_dequant(s->v, lw->wv.tmac, &bt_fpga_layer_locs[l].wv, inv_scale);
+            }
         } else
 #endif
         {
@@ -1035,7 +1043,13 @@ void bt_forward(bt_model_t* model, int token, int pos) {
         if (bt_fpga_regs) {
             inv_scale = bitlinear_quantize(s->q8_buf, s->xb, dim);
             bt_fpga_upload_activations(s->q8_buf, dim);
-            bt_fpga_gemv_dequant(s->xb2, lw->wo.tmac, &bt_fpga_layer_locs[l].wo, inv_scale);
+            if (model->btpk) {
+                bt_fpga_gemv_dequant_btpk(s->xb2, &model->btpk->layers[l].wo,
+                                          &bt_fpga_layer_locs[l].wo, inv_scale);
+            } else {
+                bt_fpga_gemv_dequant(s->xb2, lw->wo.tmac,
+                                     &bt_fpga_layer_locs[l].wo, inv_scale);
+            }
         } else
 #endif
         tmac_forward(s->xb2, s->xb, s->q8_buf, s->lut_buf, &lw->wo);
@@ -1049,8 +1063,16 @@ void bt_forward(bt_model_t* model, int token, int pos) {
 #ifdef BT_FPGA
         if (bt_fpga_regs) {
             bt_fpga_upload_activations(s->q8_buf, dim);
-            bt_fpga_gemv_dequant(s->hb, lw->w_gate.tmac, &bt_fpga_layer_locs[l].w_gate, inv_scale);
-            bt_fpga_gemv_dequant(s->hb2, lw->w_up.tmac, &bt_fpga_layer_locs[l].w_up, inv_scale);
+            if (model->btpk) {
+                btpk_layer_t* bl = &model->btpk->layers[l];
+                bt_fpga_gemv_dequant_btpk(s->hb,  &bl->w_gate,
+                                          &bt_fpga_layer_locs[l].w_gate, inv_scale);
+                bt_fpga_gemv_dequant_btpk(s->hb2, &bl->w_up,
+                                          &bt_fpga_layer_locs[l].w_up, inv_scale);
+            } else {
+                bt_fpga_gemv_dequant(s->hb,  lw->w_gate.tmac, &bt_fpga_layer_locs[l].w_gate, inv_scale);
+                bt_fpga_gemv_dequant(s->hb2, lw->w_up.tmac,   &bt_fpga_layer_locs[l].w_up,   inv_scale);
+            }
         } else
 #endif
         {
@@ -1093,7 +1115,13 @@ void bt_forward(bt_model_t* model, int token, int pos) {
         if (bt_fpga_regs) {
             inv_scale = bitlinear_quantize(s->q8_buf, s->hb2, ffn_dim);
             bt_fpga_upload_activations(s->q8_buf, ffn_dim);
-            bt_fpga_gemv_dequant(s->xb, lw->w_down.tmac, &bt_fpga_layer_locs[l].w_down, inv_scale);
+            if (model->btpk) {
+                bt_fpga_gemv_dequant_btpk(s->xb, &model->btpk->layers[l].w_down,
+                                          &bt_fpga_layer_locs[l].w_down, inv_scale);
+            } else {
+                bt_fpga_gemv_dequant(s->xb, lw->w_down.tmac,
+                                     &bt_fpga_layer_locs[l].w_down, inv_scale);
+            }
         } else
 #endif
         tmac_forward(s->xb, s->hb2, s->q8_buf, s->lut_buf, &lw->w_down);
@@ -1473,10 +1501,185 @@ static int alloc_state(bt_state_t* s, const bt_config_t* cfg) {
     return 0;
 }
 
+/* ================================================================
+ * §11b. .btpk LOADER — pre-packed, FPGA-native layout
+ *
+ * Only reachable on BT_FPGA builds: CPU-path T-MAC GEMV reads the
+ * 2-nib/8-sign CPU layout (bt_tmac_weight_t), which is not present
+ * in the .btpk format.
+ * ================================================================ */
+
+#ifdef BT_FPGA
+static int bt_load_btpk(bt_model_t* model) {
+    if (model->mmap_size < sizeof(btpk_header_t)) {
+        fprintf(stderr, "biturbo: .btpk file truncated\n");
+        return -1;
+    }
+    const btpk_header_t* h = (const btpk_header_t*)model->mmap_data;
+
+    if (h->version != BTPK_VERSION) {
+        fprintf(stderr, "biturbo: .btpk version %u, expected %u\n",
+                h->version, BTPK_VERSION);
+        return -1;
+    }
+    if (h->format != BTPK_FMT_TMAC_TL2) {
+        fprintf(stderr, "biturbo: .btpk format %u unsupported\n", h->format);
+        return -1;
+    }
+    if (h->num_engines != 32 || h->beat_bytes != 16) {
+        fprintf(stderr, "biturbo: .btpk striped for engines=%u beat=%u "
+                "but this build expects 32/16\n",
+                h->num_engines, h->beat_bytes);
+        return -1;
+    }
+    if (h->total_file_size != model->mmap_size) {
+        fprintf(stderr, "biturbo: .btpk size mismatch (%llu vs on-disk %zu)\n",
+                (unsigned long long)h->total_file_size, model->mmap_size);
+        return -1;
+    }
+
+    bt_config_t* cfg = &model->config;
+    cfg->dim         = h->dim;
+    cfg->n_layers    = h->n_layers;
+    cfg->n_heads     = h->n_heads;
+    cfg->n_kv_heads  = h->n_kv_heads;
+    cfg->vocab_size  = h->vocab_size;
+    cfg->ffn_dim     = h->ffn_dim;
+    cfg->max_seq_len = h->max_seq_len;
+    cfg->norm_eps    = h->norm_eps;
+    cfg->rope_theta  = h->rope_theta;
+
+    fprintf(stderr, "biturbo: .btpk v%u — dim=%d layers=%d heads=%d "
+            "kv_heads=%d vocab=%d ffn=%d ctx=%d\n",
+            h->version, cfg->dim, cfg->n_layers, cfg->n_heads,
+            cfg->n_kv_heads, cfg->vocab_size, cfg->ffn_dim, cfg->max_seq_len);
+
+    /* Tokenizer: parse from blob [scores][(len,bytes)*] */
+    bt_tokenizer_t* tok = &model->tokenizer;
+    tok->vocab_size    = h->tok_vocab_size;
+    tok->max_token_len = h->tok_max_token_len;
+    tok->bos_id        = h->tok_bos_id;
+    tok->eos_id        = h->tok_eos_id;
+    tok->eot_id        = h->tok_eot_id;
+    tok->vocab  = (char**)bt_calloc(tok->vocab_size, sizeof(char*));
+    tok->scores = (float*)bt_calloc(tok->vocab_size, sizeof(float));
+
+    const uint8_t* tb  = model->mmap_data + h->tokenizer_off;
+    const uint8_t* tbe = tb + h->tokenizer_size;
+    memcpy(tok->scores, tb, (size_t)tok->vocab_size * sizeof(float));
+    const uint8_t* p = tb + (size_t)tok->vocab_size * sizeof(float);
+    for (int i = 0; i < tok->vocab_size; i++) {
+        if (p + 2 > tbe) {
+            fprintf(stderr, "biturbo: .btpk tokenizer truncated at %d\n", i);
+            return -1;
+        }
+        uint16_t len;
+        memcpy(&len, p, 2); p += 2;
+        if (p + len > tbe) {
+            fprintf(stderr, "biturbo: .btpk tokenizer bad len at %d\n", i);
+            return -1;
+        }
+        tok->vocab[i] = (char*)bt_calloc(len + 1, 1);
+        memcpy(tok->vocab[i], p, len);
+        tok->vocab[i][len] = '\0';
+        p += len;
+    }
+    /* Build sorted vocab index */
+    tok->sorted_idx = (int*)bt_calloc(tok->vocab_size, sizeof(int));
+    for (int i = 0; i < tok->vocab_size; i++) tok->sorted_idx[i] = i;
+    bt_sort_vocab_global = tok->vocab;
+    qsort(tok->sorted_idx, tok->vocab_size, sizeof(int), bt_sort_vocab_cmp);
+
+    fprintf(stderr, "biturbo: tokenizer: %d tokens, bos=%d eos=%d eot=%d\n",
+            tok->vocab_size, tok->bos_id, tok->eos_id, tok->eot_id);
+
+    /* Allocate state once config is populated */
+    alloc_state(&model->state, cfg);
+
+    /* Point weights at mmap'd blobs (zero copy, zero transform) */
+    bt_weights_t* wt = &model->weights;
+    wt->token_embedding = model->mmap_data + h->token_embed_off;
+
+    wt->final_norm = (float*)bt_calloc(cfg->dim, sizeof(float));
+    memcpy(wt->final_norm,
+           model->mmap_data + h->final_norm_off,
+           (size_t)cfg->dim * sizeof(float));
+
+    /* Per-layer norms: copied to heap (they're small F32 arrays and
+     * existing code treats them as owned buffers freed in bt_free_model). */
+    wt->layers = (bt_layer_weights_t*)bt_calloc(cfg->n_layers,
+                                                 sizeof(bt_layer_weights_t));
+
+    const btpk_layer_dir_t* lds =
+        (const btpk_layer_dir_t*)(model->mmap_data + h->layers_off);
+
+    model->btpk = (bt_btpk_weights_t*)bt_calloc(1, sizeof(*model->btpk));
+    model->btpk->layers = (btpk_layer_t*)bt_calloc(cfg->n_layers,
+                                                   sizeof(btpk_layer_t));
+
+    #define LOAD_F32(dst_field, off_field, count) do { \
+        lw->dst_field = (float*)bt_calloc((count), sizeof(float)); \
+        memcpy(lw->dst_field, model->mmap_data + lds[l].off_field, \
+               (size_t)(count) * sizeof(float)); \
+    } while (0)
+
+    #define LOAD_BTPK_W(out, src) do { \
+        (out)->rows        = (int)lds[l].src.rows; \
+        (out)->cols        = (int)lds[l].src.cols; \
+        (out)->n3          = lds[l].src.n3; \
+        (out)->k_padded    = lds[l].src.k_padded; \
+        (out)->nib_stride  = lds[l].src.nib_stride; \
+        (out)->sign_stride = lds[l].src.sign_stride; \
+        (out)->nib_size    = lds[l].src.nib_size; \
+        (out)->sign_size   = lds[l].src.sign_size; \
+        (out)->nib_data    = model->mmap_data + lds[l].src.nib_off; \
+        (out)->sign_data   = model->mmap_data + lds[l].src.sign_off; \
+        (out)->scale       = lds[l].src.scale; \
+    } while (0)
+
+    for (int l = 0; l < cfg->n_layers; l++) {
+        bt_layer_weights_t* lw = &wt->layers[l];
+        btpk_layer_t*       bl = &model->btpk->layers[l];
+
+        LOAD_F32(attn_norm,     attn_norm_off,     cfg->dim);
+        LOAD_F32(attn_sub_norm, attn_sub_norm_off, cfg->dim);
+        LOAD_F32(ffn_norm,      ffn_norm_off,      cfg->dim);
+        LOAD_F32(ffn_sub_norm,  ffn_sub_norm_off,  cfg->ffn_dim);
+
+        LOAD_BTPK_W(&bl->wq,     wq);
+        LOAD_BTPK_W(&bl->wk,     wk);
+        LOAD_BTPK_W(&bl->wv,     wv);
+        LOAD_BTPK_W(&bl->wo,     wo);
+        LOAD_BTPK_W(&bl->w_gate, w_gate);
+        LOAD_BTPK_W(&bl->w_up,   w_up);
+        LOAD_BTPK_W(&bl->w_down, w_down);
+
+        /* Populate the i2s_weight rows/cols/scale/tmac so code paths
+         * that read those fields (FPGA GEMV, result dequant, state
+         * allocation) see the right dimensions. tmac stays NULL in the
+         * btpk path — FPGA fast path uses model->btpk directly. */
+        lw->wq.rows = bl->wq.rows; lw->wq.cols = bl->wq.cols; lw->wq.scale = bl->wq.scale;
+        lw->wk.rows = bl->wk.rows; lw->wk.cols = bl->wk.cols; lw->wk.scale = bl->wk.scale;
+        lw->wv.rows = bl->wv.rows; lw->wv.cols = bl->wv.cols; lw->wv.scale = bl->wv.scale;
+        lw->wo.rows = bl->wo.rows; lw->wo.cols = bl->wo.cols; lw->wo.scale = bl->wo.scale;
+        lw->w_gate.rows = bl->w_gate.rows; lw->w_gate.cols = bl->w_gate.cols; lw->w_gate.scale = bl->w_gate.scale;
+        lw->w_up.rows   = bl->w_up.rows;   lw->w_up.cols   = bl->w_up.cols;   lw->w_up.scale   = bl->w_up.scale;
+        lw->w_down.rows = bl->w_down.rows; lw->w_down.cols = bl->w_down.cols; lw->w_down.scale = bl->w_down.scale;
+    }
+
+    #undef LOAD_F32
+    #undef LOAD_BTPK_W
+
+    fprintf(stderr, "biturbo: .btpk loaded (%.1f MB mmap'd, zero repack)\n",
+            (double)model->mmap_size / (1024 * 1024));
+    return 0;
+}
+#endif /* BT_FPGA */
+
 int bt_load_model(bt_model_t* model, const char* path) {
     memset(model, 0, sizeof(*model));
 
-    /* mmap the GGUF file */
+    /* mmap the file */
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         fprintf(stderr, "biturbo: cannot open '%s'\n", path);
@@ -1493,12 +1696,50 @@ int bt_load_model(bt_model_t* model, const char* path) {
         return -1;
     }
 
+    /* Dispatch on magic: "BTPKMDL\0" → pre-packed fast path */
+    if (model->mmap_size >= 8 &&
+        memcmp(model->mmap_data, "BTPKMDL\0", 8) == 0) {
+#ifndef BT_FPGA
+        fprintf(stderr, "biturbo: .btpk requires a BT_FPGA build — "
+                "use the GGUF model for CPU inference\n");
+        munmap(model->mmap_data, model->mmap_size);
+        model->mmap_data = NULL;
+        return -1;
+#else
+        if (bt_load_btpk(model) != 0) {
+            bt_free_model(model);
+            return -1;
+        }
+#endif
+#ifdef BT_FPGA
+        {
+            uint32_t ddr3_base = 0x3E000000;
+            uint32_t ddr3_avm_base = 0x3E000000;
+            uint32_t ddr3_span = 0x02000000;
+            const char *s;
+            if ((s = getenv("BT_FPGA_DDR3_BASE")) != NULL)
+                ddr3_base = (uint32_t)strtoul(s, NULL, 0);
+            if ((s = getenv("BT_FPGA_DDR3_AVM_BASE")) != NULL)
+                ddr3_avm_base = (uint32_t)strtoul(s, NULL, 0);
+            if ((s = getenv("BT_FPGA_DDR3_SPAN")) != NULL)
+                ddr3_span = (uint32_t)strtoul(s, NULL, 0);
+            if (bt_fpga_init(ddr3_base, ddr3_avm_base, ddr3_span) == 0) {
+                bt_fpga_prepare_layout_btpk(model);
+                fprintf(stderr, "biturbo: FPGA T-MAC ready (btpk fast path)\n");
+            } else {
+                fprintf(stderr, "biturbo: FPGA init failed\n");
+            }
+        }
+#endif
+        return 0;
+    }
+
     gguf_reader_t r = { model->mmap_data, 0, model->mmap_size };
 
     /* Header */
     uint32_t magic = rd_u32(&r);
     if (magic != GGUF_MAGIC) {
-        fprintf(stderr, "biturbo: not a GGUF file\n");
+        fprintf(stderr, "biturbo: not a GGUF or .btpk file\n");
         munmap(model->mmap_data, model->mmap_size);
         return -1;
     }
@@ -1826,6 +2067,12 @@ void bt_free_model(bt_model_t* model) {
     }
     free(tok->scores);
     free(tok->sorted_idx);
+
+    /* Free btpk directory (nib/sign data lives in mmap; nothing to free) */
+    if (model->btpk) {
+        free(model->btpk->layers);
+        free(model->btpk);
+    }
 
     /* Unmap */
     if (model->mmap_data && model->mmap_data != MAP_FAILED)

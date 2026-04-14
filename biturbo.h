@@ -162,6 +162,36 @@ typedef struct {
 } bt_weights_t;
 
 /* ============================================================
+ * Pre-packed .btpk model handle (FPGA-striped nib/sign blobs)
+ *
+ * Populated by bt_load_model when the file magic is "BTPKMDL\0".
+ * The FPGA fast path consumes btpk_weight directly — each layer
+ * switch becomes a memcpy(DDR3, mmap_base + off, size) per weight.
+ * NULL when the model was loaded from GGUF.
+ * ============================================================ */
+typedef struct {
+    int      rows;
+    int      cols;
+    int      n3;          /* CPU n3 = cols / 3                   */
+    int      k_padded;    /* ((cols + 2) / 3) * 3                */
+    int      nib_stride;  /* FPGA row stride (bytes)             */
+    int      sign_stride; /* FPGA row stride (bytes)             */
+    uint64_t nib_size;
+    uint64_t sign_size;
+    const uint8_t* nib_data;   /* mmap pointer, pre-striped      */
+    const uint8_t* sign_data;  /* mmap pointer, pre-striped      */
+    float    scale;
+} btpk_weight_t;
+
+typedef struct {
+    btpk_weight_t wq, wk, wv, wo, w_gate, w_up, w_down;
+} btpk_layer_t;
+
+typedef struct {
+    btpk_layer_t* layers;     /* [n_layers] ternary weights      */
+} bt_btpk_weights_t;
+
+/* ============================================================
  * Inference state
  * ============================================================ */
 
@@ -194,6 +224,9 @@ typedef struct {
     bt_tokenizer_t  tokenizer;
     uint8_t*        mmap_data;
     size_t          mmap_size;
+    /* Non-NULL only when model was loaded from a .btpk file.
+     * The FPGA fast path keys off this to skip per-layer repack. */
+    bt_btpk_weights_t* btpk;
 } bt_model_t;
 
 /* ============================================================
