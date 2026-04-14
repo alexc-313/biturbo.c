@@ -1510,6 +1510,53 @@ static int alloc_state(bt_state_t* s, const bt_config_t* cfg) {
  * ================================================================ */
 
 #ifdef BT_FPGA
+static int btpk_check_range(const bt_model_t* model,
+                            uint64_t off, uint64_t size,
+                            const char* what) {
+    uint64_t file_size = (uint64_t)model->mmap_size;
+    if (off > file_size || size > file_size - off) {
+        fprintf(stderr,
+                "biturbo: .btpk %s range out of bounds "
+                "(off=%llu size=%llu file=%llu)\n",
+                what,
+                (unsigned long long)off,
+                (unsigned long long)size,
+                (unsigned long long)file_size);
+        return -1;
+    }
+    return 0;
+}
+
+static int btpk_check_weight_dir(const bt_model_t* model,
+                                 const btpk_weight_dir_t* wd,
+                                 const char* what) {
+    uint64_t expect_nib = (uint64_t)wd->rows * (uint64_t)wd->nib_stride;
+    uint64_t expect_sign = (uint64_t)wd->rows * (uint64_t)wd->sign_stride;
+
+    if (wd->rows == 0 || wd->cols == 0 || wd->nib_stride <= 0 || wd->sign_stride <= 0) {
+        fprintf(stderr, "biturbo: .btpk %s has invalid dimensions/strides\n", what);
+        return -1;
+    }
+    if (wd->nib_size != expect_nib || wd->sign_size != expect_sign) {
+        fprintf(stderr,
+                "biturbo: .btpk %s size/stride mismatch "
+                "(nib=%llu expect=%llu sign=%llu expect=%llu)\n",
+                what,
+                (unsigned long long)wd->nib_size,
+                (unsigned long long)expect_nib,
+                (unsigned long long)wd->sign_size,
+                (unsigned long long)expect_sign);
+        return -1;
+    }
+    if (btpk_check_range(model, wd->nib_off, wd->nib_size, what) != 0) {
+        return -1;
+    }
+    if (btpk_check_range(model, wd->sign_off, wd->sign_size, what) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 static int bt_load_btpk(bt_model_t* model) {
     if (model->mmap_size < sizeof(btpk_header_t)) {
         fprintf(stderr, "biturbo: .btpk file truncated\n");
@@ -1549,6 +1596,45 @@ static int bt_load_btpk(bt_model_t* model) {
     cfg->norm_eps    = h->norm_eps;
     cfg->rope_theta  = h->rope_theta;
 
+    if (btpk_check_range(model, h->tokenizer_off, h->tokenizer_size, "tokenizer") != 0)
+        return -1;
+    if (btpk_check_range(model, h->layers_off,
+                         (uint64_t)cfg->n_layers * sizeof(btpk_layer_dir_t),
+                         "layer directory") != 0)
+        return -1;
+
+    {
+        uint64_t expected_embed_size =
+            (uint64_t)cfg->vocab_size *
+            (uint64_t)((cfg->dim + BT_QK_K - 1) / BT_QK_K) *
+            (uint64_t)sizeof(bt_block_q6k_t);
+        uint64_t expected_final_norm_size =
+            (uint64_t)cfg->dim * sizeof(float);
+
+        if (h->token_embed_size < expected_embed_size) {
+            fprintf(stderr,
+                    "biturbo: .btpk token embedding too small "
+                    "(%llu < %llu)\n",
+                    (unsigned long long)h->token_embed_size,
+                    (unsigned long long)expected_embed_size);
+            return -1;
+        }
+        if (h->final_norm_size < expected_final_norm_size) {
+            fprintf(stderr,
+                    "biturbo: .btpk final_norm too small "
+                    "(%llu < %llu)\n",
+                    (unsigned long long)h->final_norm_size,
+                    (unsigned long long)expected_final_norm_size);
+            return -1;
+        }
+        if (btpk_check_range(model, h->token_embed_off, h->token_embed_size,
+                             "token embedding") != 0)
+            return -1;
+        if (btpk_check_range(model, h->final_norm_off, h->final_norm_size,
+                             "final_norm") != 0)
+            return -1;
+    }
+
     fprintf(stderr, "biturbo: .btpk v%u — dim=%d layers=%d heads=%d "
             "kv_heads=%d vocab=%d ffn=%d ctx=%d\n",
             h->version, cfg->dim, cfg->n_layers, cfg->n_heads,
@@ -1566,6 +1652,10 @@ static int bt_load_btpk(bt_model_t* model) {
 
     const uint8_t* tb  = model->mmap_data + h->tokenizer_off;
     const uint8_t* tbe = tb + h->tokenizer_size;
+    if (h->tokenizer_size < (uint64_t)tok->vocab_size * sizeof(float)) {
+        fprintf(stderr, "biturbo: .btpk tokenizer blob too small for scores\n");
+        return -1;
+    }
     memcpy(tok->scores, tb, (size_t)tok->vocab_size * sizeof(float));
     const uint8_t* p = tb + (size_t)tok->vocab_size * sizeof(float);
     for (int i = 0; i < tok->vocab_size; i++) {
@@ -1640,6 +1730,39 @@ static int bt_load_btpk(bt_model_t* model) {
     for (int l = 0; l < cfg->n_layers; l++) {
         bt_layer_weights_t* lw = &wt->layers[l];
         btpk_layer_t*       bl = &model->btpk->layers[l];
+        char what[64];
+
+        snprintf(what, sizeof(what), "layer %d attn_norm", l);
+        if (btpk_check_range(model, lds[l].attn_norm_off,
+                             (uint64_t)cfg->dim * sizeof(float), what) != 0)
+            return -1;
+        snprintf(what, sizeof(what), "layer %d attn_sub_norm", l);
+        if (btpk_check_range(model, lds[l].attn_sub_norm_off,
+                             (uint64_t)cfg->dim * sizeof(float), what) != 0)
+            return -1;
+        snprintf(what, sizeof(what), "layer %d ffn_norm", l);
+        if (btpk_check_range(model, lds[l].ffn_norm_off,
+                             (uint64_t)cfg->dim * sizeof(float), what) != 0)
+            return -1;
+        snprintf(what, sizeof(what), "layer %d ffn_sub_norm", l);
+        if (btpk_check_range(model, lds[l].ffn_sub_norm_off,
+                             (uint64_t)cfg->ffn_dim * sizeof(float), what) != 0)
+            return -1;
+
+        snprintf(what, sizeof(what), "layer %d wq", l);
+        if (btpk_check_weight_dir(model, &lds[l].wq, what) != 0) return -1;
+        snprintf(what, sizeof(what), "layer %d wk", l);
+        if (btpk_check_weight_dir(model, &lds[l].wk, what) != 0) return -1;
+        snprintf(what, sizeof(what), "layer %d wv", l);
+        if (btpk_check_weight_dir(model, &lds[l].wv, what) != 0) return -1;
+        snprintf(what, sizeof(what), "layer %d wo", l);
+        if (btpk_check_weight_dir(model, &lds[l].wo, what) != 0) return -1;
+        snprintf(what, sizeof(what), "layer %d w_gate", l);
+        if (btpk_check_weight_dir(model, &lds[l].w_gate, what) != 0) return -1;
+        snprintf(what, sizeof(what), "layer %d w_up", l);
+        if (btpk_check_weight_dir(model, &lds[l].w_up, what) != 0) return -1;
+        snprintf(what, sizeof(what), "layer %d w_down", l);
+        if (btpk_check_weight_dir(model, &lds[l].w_down, what) != 0) return -1;
 
         LOAD_F32(attn_norm,     attn_norm_off,     cfg->dim);
         LOAD_F32(attn_sub_norm, attn_sub_norm_off, cfg->dim);
@@ -1727,7 +1850,10 @@ int bt_load_model(bt_model_t* model, const char* path) {
                 bt_fpga_prepare_layout_btpk(model);
                 fprintf(stderr, "biturbo: FPGA T-MAC ready (btpk fast path)\n");
             } else {
-                fprintf(stderr, "biturbo: FPGA init failed\n");
+                fprintf(stderr,
+                        "biturbo: FPGA init failed; .btpk requires FPGA fast path\n");
+                bt_free_model(model);
+                return -1;
             }
         }
 #endif
