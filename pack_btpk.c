@@ -67,7 +67,8 @@ static void stripe_to_fpga(const struct bt_tmac_weight* tw,
                            uint8_t* nib_out, int nib_stride,
                            uint8_t* sign_out, int sign_stride) {
     int rows = tw->rows;
-    int n3   = tw->n3;
+    int n3_cpu = tw->n3;
+    int n3_total = (tw->cols + 2) / 3;
     int tiles_per_row = nib_stride / BTPK_BEAT_BYTES;
 
     memset(nib_out,  0, (size_t)rows * nib_stride);
@@ -83,27 +84,38 @@ static void stripe_to_fpga(const struct bt_tmac_weight* tw,
             uint8_t* beat = nib_row_out + t * BTPK_BEAT_BYTES;
             for (int e = 0; e < BTPK_NUM_ENGINES; e++) {
                 int g = t * BTPK_NUM_ENGINES + e;
-                if (g >= n3) break;
+                int nibble = 0;
+                int sign_bit = 0;
 
-                uint8_t packed = nib_row[g / 2];
-                int nibble = (g & 1) ? (packed & 0x0F) : (packed >> 4);
+                if (g >= n3_total) break;
 
-                int byte_pos = e / 2;
-                if (e & 1) beat[byte_pos] |= (uint8_t)(nibble << 4);
-                else       beat[byte_pos] |= (uint8_t)(nibble & 0x0F);
+                if (g < n3_cpu) {
+                    uint8_t packed = nib_row[g / 2];
+                    nibble = (g & 1) ? (packed & 0x0F) : (packed >> 4);
+                    sign_bit = (sign_row[g / 8] >> (g & 7)) & 1;
+                } else {
+                    int tail_rc = bt_tmac_tail_group_encode(tw, r, &nibble, &sign_bit);
+                    if (tail_rc < 0) {
+                        nibble = 0;
+                        sign_bit = 0;
+                    }
+                }
+
+                {
+                    int byte_pos = e / 2;
+                    if (e & 1) beat[byte_pos] |= (uint8_t)(nibble << 4);
+                    else       beat[byte_pos] |= (uint8_t)(nibble & 0x0F);
+                }
+
+                if (sign_bit) {
+                    int tile = g / BTPK_NUM_ENGINES;
+                    int eng  = g % BTPK_NUM_ENGINES;
+                    int sign_beat = tile / 4;
+                    int chunk = tile % 4;
+                    int byte_off = sign_beat * BTPK_BEAT_BYTES + chunk * 4 + eng / 8;
+                    sign_row_out[byte_off] |= (uint8_t)(1 << (eng & 7));
+                }
             }
-        }
-
-        for (int g = 0; g < n3; g++) {
-            int sign_bit = (sign_row[g / 8] >> (g & 7)) & 1;
-            if (!sign_bit) continue;
-
-            int tile = g / BTPK_NUM_ENGINES;
-            int eng  = g % BTPK_NUM_ENGINES;
-            int sign_beat = tile / 4;
-            int chunk = tile % 4;
-            int byte_off = sign_beat * BTPK_BEAT_BYTES + chunk * 4 + eng / 8;
-            sign_row_out[byte_off] |= (uint8_t)(1 << (eng & 7));
         }
     }
 }
@@ -191,7 +203,7 @@ static void emit_weight(const bt_i2s_weight_t* w,
 
     dir->rows        = (uint32_t)tw->rows;
     dir->cols        = (uint32_t)tw->cols;
-    dir->n3          = tw->n3;
+    dir->n3          = n3_padded;
     dir->k_padded    = k_padded;
     dir->nib_stride  = nib_stride;
     dir->sign_stride = sign_stride;

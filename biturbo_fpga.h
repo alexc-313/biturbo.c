@@ -287,7 +287,8 @@ static void bt_fpga_prepare_layout(bt_model_t *model) {
 static void bt_fpga_repack_to_ddr3(const bt_tmac_weight_t *tw,
                                    const bt_fpga_wt_loc_t *loc) {
     int rows = tw->rows;
-    int n3 = tw->n3;
+    int n3_cpu = tw->n3;
+    int n3_total = (tw->cols + 2) / 3;
     int nib_stride = loc->nib_stride;
     int sign_stride = loc->sign_stride;
 
@@ -310,31 +311,38 @@ static void bt_fpga_repack_to_ddr3(const bt_tmac_weight_t *tw,
             uint8_t *beat = nib_out + t * BT_FPGA_BEAT_BYTES;
             for (int e = 0; e < BT_FPGA_NUM_ENGINES; e++) {
                 int g = t * BT_FPGA_NUM_ENGINES + e;
-                if (g >= n3) break;
+                int nibble = 0;
+                int sign_bit = 0;
+                if (g >= n3_total) break;
 
-                uint8_t packed = nib_row[g / 2];
-                int nibble = (g & 1) ? (packed & 0x0F) : (packed >> 4);
+                if (g < n3_cpu) {
+                    uint8_t packed = nib_row[g / 2];
+                    nibble = (g & 1) ? (packed & 0x0F) : (packed >> 4);
+                    sign_bit = (sign_row[g / 8] >> (g & 7)) & 1;
+                } else {
+                    int tail_rc = bt_tmac_tail_group_encode(tw, r, &nibble, &sign_bit);
+                    if (tail_rc < 0) {
+                        nibble = 0;
+                        sign_bit = 0;
+                    }
+                }
 
                 int byte_pos = e / 2;
                 if (e & 1)
                     beat[byte_pos] |= (uint8_t)(nibble << 4);
                 else
                     beat[byte_pos] |= (uint8_t)(nibble & 0x0F);
+
+                if (sign_bit) {
+                    int tile = g / BT_FPGA_NUM_ENGINES;
+                    int eng = g % BT_FPGA_NUM_ENGINES;
+                    int sign_beat = tile / 4;
+                    int chunk = tile % 4;
+
+                    int byte_off = sign_beat * BT_FPGA_BEAT_BYTES + chunk * 4 + eng / 8;
+                    sign_out[byte_off] |= (uint8_t)(1 << (eng & 7));
+                }
             }
-        }
-
-        /* Repack signs into 128-bit beats (4 tiles × 32 sign bits each) */
-        for (int g = 0; g < n3; g++) {
-            int sign_bit = (sign_row[g / 8] >> (g & 7)) & 1;
-            if (!sign_bit) continue;
-
-            int tile = g / BT_FPGA_NUM_ENGINES;
-            int eng = g % BT_FPGA_NUM_ENGINES;
-            int sign_beat = tile / 4;
-            int chunk = tile % 4;
-
-            int byte_off = sign_beat * BT_FPGA_BEAT_BYTES + chunk * 4 + eng / 8;
-            sign_out[byte_off] |= (uint8_t)(1 << (eng & 7));
         }
     }
     fprintf(stderr, "[FPGA] repack %d\n", rows);

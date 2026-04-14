@@ -586,14 +586,12 @@ static void tmac_build_two_lut(int16_t* lut, const int8_t* x_q,
     }
 }
 
-/* T-MAC TL2 GEMV kernel */
-static void tmac_gemv(float* out, const bt_tmac_weight_t* tw,
-                      float inv_scale,
-                      const int16_t* three_lut, const int16_t* two_lut) {
+/* T-MAC TL2 GEMV kernel (raw accumulator output) */
+static void tmac_gemv_raw(int32_t* out, const bt_tmac_weight_t* tw,
+                          const int16_t* three_lut, const int16_t* two_lut) {
     int rows = tw->rows;
     int n3 = tw->n3;
     int n2 = tw->n2;
-    float dequant = inv_scale * tw->scale;
 
     for (int r = 0; r < rows; r++) {
         int32_t acc = 0;
@@ -625,9 +623,113 @@ static void tmac_gemv(float* out, const bt_tmac_weight_t* tw,
             }
         }
 
+        out[r] = acc;
+    }
+}
+
+/* T-MAC TL2 GEMV kernel */
+static void tmac_gemv(float* out, const bt_tmac_weight_t* tw,
+                      float inv_scale,
+                      const int16_t* three_lut, const int16_t* two_lut) {
+    float dequant = inv_scale * tw->scale;
+    for (int r = 0; r < tw->rows; r++) {
+        int32_t acc = 0;
+
+        /* Three-weight groups */
+        const uint8_t* nib_row  = tw->three_nib  + (size_t)r * tw->nib3_stride;
+        const uint8_t* sign_row = tw->three_sign + (size_t)r * tw->sign_stride;
+
+        for (int g = 0; g < tw->n3; g++) {
+            uint8_t packed = nib_row[g / 2];
+            int nibble = (g & 1) ? (packed & 0x0F) : (packed >> 4);
+            int sign_bit = (sign_row[g / 8] >> (g & 7)) & 1;
+            int16_t val = three_lut[g * 16 + nibble];
+            acc += sign_bit ? -(int32_t)val : (int32_t)val;
+        }
+
+        if (tw->n2 > 0) {
+            const uint8_t* nib2_row = tw->two_nib + (size_t)r * tw->nib2_stride;
+            for (int g = 0; g < tw->n2; g++) {
+                uint8_t packed = nib2_row[g / 2];
+                int nibble = (g & 1) ? (packed & 0x0F) : (packed >> 4);
+                acc += (int32_t)two_lut[g * 16 + nibble];
+            }
+        }
+
         out[r] = (float)acc * dequant;
     }
 }
+
+#ifdef BT_FPGA
+static int bt_fpga_compare_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* s = getenv("BT_FPGA_COMPARE");
+        cached = (s && s[0] != '\0' && strcmp(s, "0") != 0) ? 1 : 0;
+    }
+    return cached;
+}
+
+static void bt_fpga_compare_tmac(const char* stage, int layer,
+                                 const bt_tmac_weight_t* tw,
+                                 const int8_t* q8_buf, float inv_scale,
+                                 const float* fpga_out) {
+    static int compare_budget = 0;
+    if (!bt_fpga_compare_enabled() || compare_budget >= 8)
+        return;
+
+    size_t lut_elems = (size_t)(tw->n3 + tw->n2) * 16;
+    int16_t* lut_buf = (int16_t*)malloc(lut_elems * sizeof(*lut_buf));
+    int32_t* raw_cpu = (int32_t*)malloc((size_t)tw->rows * sizeof(*raw_cpu));
+    if (!lut_buf || !raw_cpu) {
+        fprintf(stderr, "[FPGA-CMP] OOM while comparing %s L%d\n", stage, layer);
+        free(lut_buf);
+        free(raw_cpu);
+        compare_budget++;
+        return;
+    }
+
+    tmac_build_three_lut(lut_buf, q8_buf, tw->n3);
+    {
+        int16_t* two_lut = lut_buf + tw->n3 * 16;
+        tmac_build_two_lut(two_lut, q8_buf, tw->n3 * 3, tw->cols, tw->n2);
+        tmac_gemv_raw(raw_cpu, tw, lut_buf, two_lut);
+    }
+
+    float dequant = inv_scale * tw->scale;
+    int worst_row = 0;
+    double max_abs = 0.0;
+    double sum_abs = 0.0;
+    for (int r = 0; r < tw->rows; r++) {
+        double cpu = (double)raw_cpu[r] * (double)dequant;
+        double diff = fabs(cpu - (double)fpga_out[r]);
+        sum_abs += diff;
+        if (diff > max_abs) {
+            max_abs = diff;
+            worst_row = r;
+        }
+    }
+
+    fprintf(stderr,
+            "[FPGA-CMP] L%d %s rows=%d cols=%d max_abs=%.6g mean_abs=%.6g worst_row=%d\n",
+            layer, stage, tw->rows, tw->cols,
+            max_abs, sum_abs / (double)tw->rows, worst_row);
+
+    {
+        int sample = tw->rows < 8 ? tw->rows : 8;
+        for (int i = 0; i < sample; i++) {
+            float cpu = (float)raw_cpu[i] * dequant;
+            fprintf(stderr,
+                    "  [FPGA-CMP] row %d cpu=% .6f fpga=% .6f diff=% .6f\n",
+                    i, cpu, fpga_out[i], cpu - fpga_out[i]);
+        }
+    }
+
+    free(lut_buf);
+    free(raw_cpu);
+    compare_budget++;
+}
+#endif
 
 /* T-MAC BitLinear forward: quantize → build LUTs → T-MAC GEMV */
 static void tmac_forward(float* out, const float* x, int8_t* q8_buf,
@@ -974,8 +1076,11 @@ void bt_forward(bt_model_t* model, int token, int pos) {
                 bt_fpga_gemv_dequant_btpk(s->v, &bl->wv, &bt_fpga_layer_locs[l].wv, inv_scale);
             } else {
                 bt_fpga_gemv_dequant(s->q, lw->wq.tmac, &bt_fpga_layer_locs[l].wq, inv_scale);
+                bt_fpga_compare_tmac("wq", l, lw->wq.tmac, s->q8_buf, inv_scale, s->q);
                 bt_fpga_gemv_dequant(s->k, lw->wk.tmac, &bt_fpga_layer_locs[l].wk, inv_scale);
+                bt_fpga_compare_tmac("wk", l, lw->wk.tmac, s->q8_buf, inv_scale, s->k);
                 bt_fpga_gemv_dequant(s->v, lw->wv.tmac, &bt_fpga_layer_locs[l].wv, inv_scale);
+                bt_fpga_compare_tmac("wv", l, lw->wv.tmac, s->q8_buf, inv_scale, s->v);
             }
         } else
 #endif
@@ -1049,6 +1154,7 @@ void bt_forward(bt_model_t* model, int token, int pos) {
             } else {
                 bt_fpga_gemv_dequant(s->xb2, lw->wo.tmac,
                                      &bt_fpga_layer_locs[l].wo, inv_scale);
+                bt_fpga_compare_tmac("wo", l, lw->wo.tmac, s->q8_buf, inv_scale, s->xb2);
             }
         } else
 #endif
@@ -1071,7 +1177,9 @@ void bt_forward(bt_model_t* model, int token, int pos) {
                                           &bt_fpga_layer_locs[l].w_up, inv_scale);
             } else {
                 bt_fpga_gemv_dequant(s->hb,  lw->w_gate.tmac, &bt_fpga_layer_locs[l].w_gate, inv_scale);
+                bt_fpga_compare_tmac("w_gate", l, lw->w_gate.tmac, s->q8_buf, inv_scale, s->hb);
                 bt_fpga_gemv_dequant(s->hb2, lw->w_up.tmac,   &bt_fpga_layer_locs[l].w_up,   inv_scale);
+                bt_fpga_compare_tmac("w_up", l, lw->w_up.tmac, s->q8_buf, inv_scale, s->hb2);
             }
         } else
 #endif
@@ -1121,6 +1229,7 @@ void bt_forward(bt_model_t* model, int token, int pos) {
             } else {
                 bt_fpga_gemv_dequant(s->xb, lw->w_down.tmac,
                                      &bt_fpga_layer_locs[l].w_down, inv_scale);
+                bt_fpga_compare_tmac("w_down", l, lw->w_down.tmac, s->q8_buf, inv_scale, s->xb);
             }
         } else
 #endif
@@ -1537,6 +1646,10 @@ static int btpk_check_weight_dir(const bt_model_t* model,
         fprintf(stderr, "biturbo: .btpk %s has invalid dimensions/strides\n", what);
         return -1;
     }
+    if (wd->k_padded <= 0 || (wd->k_padded % 3) != 0 || wd->n3 != (wd->k_padded / 3)) {
+        fprintf(stderr, "biturbo: .btpk %s has inconsistent tail packing metadata\n", what);
+        return -1;
+    }
     if (wd->nib_size != expect_nib || wd->sign_size != expect_sign) {
         fprintf(stderr,
                 "biturbo: .btpk %s size/stride mismatch "
@@ -1565,7 +1678,9 @@ static int bt_load_btpk(bt_model_t* model) {
     const btpk_header_t* h = (const btpk_header_t*)model->mmap_data;
 
     if (h->version != BTPK_VERSION) {
-        fprintf(stderr, "biturbo: .btpk version %u, expected %u\n",
+        fprintf(stderr,
+                "biturbo: .btpk version %u, expected %u "
+                "(repack the model with the current pack_btpk; v1 dropped K%%3 tails)\n",
                 h->version, BTPK_VERSION);
         return -1;
     }

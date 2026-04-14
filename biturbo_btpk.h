@@ -36,7 +36,7 @@
 #define BTPK_MAGIC6 'L'
 #define BTPK_MAGIC7 '\0'
 
-#define BTPK_VERSION      1
+#define BTPK_VERSION      2
 #define BTPK_FMT_TMAC_TL2 1   /* engine-striped T-MAC TL2 */
 #define BTPK_BLOB_ALIGN   64  /* 4× beat size; generous cache-line alignment */
 
@@ -89,17 +89,15 @@ typedef struct {
  * DDR3[nib_base]. Same for sign_blob. Strides are in bytes per
  * output row; blob_size = rows * stride (no extra padding).
  *
- * When cols % 3 != 0, the last ternary column(s) are dropped —
- * this matches bt_fpga_repack_to_ddr3() which only packs CPU's n3
- * (= cols/3) groups and leaves the k-padding nibble as 0 (weight=0).
- * The software T-MAC path handles the remainder via two_nib, but
- * the FPGA target intentionally ignores it. We do not serialize
- * two_nib for the FPGA-targeted .btpk format.
+ * When cols % 3 != 0, the tail 1-2 ternary weights are preserved as one
+ * extra padded 3-weight group (w0, w1, 0). This matches the FPGA's K-padding
+ * behaviour, because the activation uploader already pads missing inputs with
+ * zero before LUT build.
  */
 typedef struct {
     uint32_t rows;
     uint32_t cols;
-    int32_t  n3;            /* = cols / 3                         */
+    int32_t  n3;            /* serialized 3-weight groups         */
     int32_t  k_padded;      /* = ((cols + 2)/3) * 3               */
     int32_t  nib_stride;    /* bytes per row — FPGA layout        */
     int32_t  sign_stride;   /* bytes per row — FPGA layout        */

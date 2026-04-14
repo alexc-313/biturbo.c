@@ -89,6 +89,34 @@ struct bt_tmac_weight {
     int      nib2_stride;   /* bytes per row for two_nib                  */
 };
 
+/* Convert the CPU-side two-weight remainder encoding into the equivalent
+ * padded 3-weight T-MAC group (w0, w1, 0). This lets the FPGA path preserve
+ * cols % 3 != 0 semantics by storing the tail as one final 3-weight group. */
+static inline int bt_tmac_tail_group_encode(const bt_tmac_weight_t* tw, int row,
+                                            int* nibble_out, int* sign_out) {
+    static const uint8_t BT_TMAC2_TO_TMAC3_NIB[9]  = { 0, 2, 2, 3, 6, 9, 3, 9, 6 };
+    static const uint8_t BT_TMAC2_TO_TMAC3_SIGN[9] = { 0, 0, 1, 0, 0, 0, 1, 1, 1 };
+
+    if (nibble_out) *nibble_out = 0;
+    if (sign_out) *sign_out = 0;
+
+    if (!tw || tw->n2 <= 0 || !tw->two_nib) {
+        return 0;
+    }
+
+    {
+        const uint8_t packed = tw->two_nib[(size_t)row * tw->nib2_stride];
+        const uint8_t two_nib = packed >> 4;  /* the remainder is always stored in the high nibble */
+        if (two_nib >= 9) {
+            return -1;
+        }
+        if (nibble_out) *nibble_out = (int)BT_TMAC2_TO_TMAC3_NIB[two_nib];
+        if (sign_out) *sign_out = (int)BT_TMAC2_TO_TMAC3_SIGN[two_nib];
+    }
+
+    return 1;
+}
+
 /* ============================================================
  * TurboQuant KV cache block (4-bit: 3-bit codebook + 1-bit QJL)
  *
@@ -172,7 +200,7 @@ typedef struct {
 typedef struct {
     int      rows;
     int      cols;
-    int      n3;          /* CPU n3 = cols / 3                   */
+    int      n3;          /* serialized 3-weight groups          */
     int      k_padded;    /* ((cols + 2) / 3) * 3                */
     int      nib_stride;  /* FPGA row stride (bytes)             */
     int      sign_stride; /* FPGA row stride (bytes)             */

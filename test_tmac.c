@@ -317,12 +317,126 @@ static int test_gemv_bitexact(void) {
     return errors;
 }
 
+/* ================================================================
+ * Test 4: FPGA padded-tail equivalence
+ * Verify that synthesizing the cols%3 tail into one final padded
+ * 3-weight group produces the same result as the scalar reference.
+ * ================================================================ */
+static int test_fpga_padded_tail_equivalence(void) {
+    printf("Test 4: FPGA padded-tail equivalence... ");
+    int errors = 0;
+    const int rows = 3;
+    const int test_cols[] = { 10, 11 };  /* remainder 1 and remainder 2 */
+    const int n_cases = (int)(sizeof(test_cols) / sizeof(test_cols[0]));
+    const int8_t acts_src[12] = { 13, -9, 7, -5, 3, -1, 2, -4, 6, -8, 10, -12 };
+
+    for (int tc = 0; tc < n_cases; tc++) {
+        int cols = test_cols[tc];
+        int k_padded = ((cols + 2) / 3) * 3;
+        int n3_total = k_padded / 3;
+        int n_blocks = (cols + 127) / 128;
+        int bytes_per_row = n_blocks * 32;
+        uint8_t* packed = (uint8_t*)calloc((size_t)rows * bytes_per_row + 4, 1);
+        int8_t acts[12] = {0};
+
+        if (!packed) {
+            printf("FAIL: OOM\n");
+            return errors + 1;
+        }
+
+        memcpy(acts, acts_src, sizeof(acts_src));
+
+        for (int r = 0; r < rows; r++) {
+            for (int c = 0; c < cols; c++) {
+                int8_t v = (int8_t)(((r * 5 + c * 2) % 3) - 1);
+
+                {
+                    int block = c / 128;
+                    int group = (c % 128) / 32;
+                    int pos   = c % 32;
+                    uint8_t code = (v == -1) ? 0 : (v == 0 ? 1 : 2);
+                    packed[r * bytes_per_row + block * 32 + pos] |= (uint8_t)(code << (6 - 2 * group));
+                }
+            }
+        }
+
+        {
+            float scale = 0.25f;
+            float inv_scale = 0.5f;
+            bt_i2s_weight_t w = {0};
+            float out_scalar[3];
+            float out_fpga[3];
+
+            memcpy(packed + (size_t)rows * bytes_per_row, &scale, 4);
+
+            w.data = packed;
+            w.scale = scale;
+            w.rows = rows;
+            w.cols = cols;
+
+            i2s_gemv(out_scalar, &w, acts, inv_scale);
+            tmac_repack(&w);
+
+            {
+                bt_tmac_weight_t* tw = w.tmac;
+                int16_t three_lut[12 * 16];
+                int8_t acts_padded[12] = {0};
+                memcpy(acts_padded, acts, (size_t)cols);
+                memset(three_lut, 0, sizeof(three_lut));
+                tmac_build_three_lut(three_lut, acts_padded, n3_total);
+
+                for (int r = 0; r < rows; r++) {
+                    int32_t acc = 0;
+                    for (int g = 0; g < n3_total; g++) {
+                        int nibble = 0;
+                        int sign = 0;
+
+                        if (g < tw->n3) {
+                            uint8_t packed_nib = tw->three_nib[(size_t)r * tw->nib3_stride + g / 2];
+                            nibble = (g & 1) ? (packed_nib & 0x0F) : (packed_nib >> 4);
+                            sign = (tw->three_sign[(size_t)r * tw->sign_stride + g / 8] >> (g & 7)) & 1;
+                        } else {
+                            if (bt_tmac_tail_group_encode(tw, r, &nibble, &sign) < 0) {
+                                printf("FAIL: invalid tail encoding for cols=%d row=%d\n", cols, r);
+                                errors++;
+                                nibble = 0;
+                                sign = 0;
+                            }
+                        }
+
+                        {
+                            int16_t val = three_lut[g * 16 + nibble];
+                            acc += sign ? -(int32_t)val : (int32_t)val;
+                        }
+                    }
+
+                    out_fpga[r] = (float)acc * inv_scale * scale;
+                    if (out_fpga[r] != out_scalar[r]) {
+                        printf("FAIL: cols=%d row=%d scalar=%.6f fpga-tail=%.6f\n",
+                               cols, r, out_scalar[r], out_fpga[r]);
+                        errors++;
+                    }
+                }
+            }
+
+            tmac_free(&w);
+        }
+
+        free(packed);
+    }
+
+    if (errors == 0) printf("PASS\n");
+    else printf("%d errors\n", errors);
+    return errors;
+}
+
 int main(void) {
     printf("=== T-MAC TL2 Tests ===\n\n");
     int total_errors = 0;
     total_errors += test_encoding_table();
     total_errors += test_repack_roundtrip();
     total_errors += test_gemv_bitexact();
+    total_errors += test_fpga_padded_tail_equivalence();
     printf("\n%s (%d errors)\n",
            total_errors == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED",
            total_errors);
