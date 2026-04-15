@@ -81,6 +81,40 @@ huggingface-cli download microsoft/bitnet-b1.58-2B-4T-bf16 --local-dir model-bf1
 python BitNet/utils/convert-ms-to-gguf-bitnet.py model-bf16/ --outtype i2_s
 ```
 
+## Pre-pack GGUF for FPGA (.btpk)
+
+`pack_btpk` is an offline pre-packer that converts a GGUF model into a
+standalone `.btpk` file whose ternary weights are already engine-striped for
+the DE10-Nano T-MAC accelerator.
+
+Build it with the rest of the project:
+
+```bash
+make
+# or: make pack_btpk
+```
+
+Convert a GGUF model into `.btpk`:
+
+```bash
+./pack_btpk model/ggml-model-i2_s.gguf model/ggml-model-i2_s.btpk
+```
+
+This loads the GGUF model, runs the normal `tmac_repack` path once offline,
+and writes tokenizer data, token embeddings, norms, and pre-striped weight
+blobs into the output file.
+
+Use the resulting `.btpk` file only with the FPGA build on the DE10-Nano:
+
+```bash
+make fpga
+# copy biturbo_fpga to the board, then run it there
+./biturbo_fpga model/ggml-model-i2_s.btpk -p "Where is Tokyo?" -n 64
+```
+
+The CPU-only `./biturbo` executable expects a GGUF model and will reject
+`.btpk` files.
+
 ## Run
 
 ```bash
