@@ -1968,9 +1968,9 @@ int bt_load_model(bt_model_t* model, const char* path) {
 #endif
 #ifdef BT_FPGA
         {
-            uint32_t ddr3_base = 0x3E000000;
-            uint32_t ddr3_avm_base = 0x3E000000;
-            uint32_t ddr3_span = 0x02000000;
+            uint32_t ddr3_base = 0x24000000;
+            uint32_t ddr3_avm_base = 0x24000000;
+            uint32_t ddr3_span = 0x1C000000;
             const char *s;
             if ((s = getenv("BT_FPGA_DDR3_BASE")) != NULL)
                 ddr3_base = (uint32_t)strtoul(s, NULL, 0);
@@ -1979,7 +1979,12 @@ int bt_load_model(bt_model_t* model, const char* path) {
             if ((s = getenv("BT_FPGA_DDR3_SPAN")) != NULL)
                 ddr3_span = (uint32_t)strtoul(s, NULL, 0);
             if (bt_fpga_init(ddr3_base, ddr3_avm_base, ddr3_span) == 0) {
-                bt_fpga_prepare_layout_btpk(model);
+                if (bt_fpga_prepare_layout_btpk(model) != 0) {
+                    fprintf(stderr,
+                            "biturbo: FPGA layout init failed; .btpk requires FPGA fast path\n");
+                    bt_free_model(model);
+                    return -1;
+                }
                 fprintf(stderr, "biturbo: FPGA T-MAC ready (btpk fast path)\n");
             } else {
                 fprintf(stderr,
@@ -2247,9 +2252,9 @@ int bt_load_model(bt_model_t* model, const char* path) {
 
 #ifdef BT_FPGA
     {
-        uint32_t ddr3_base = 0x3E000000;
-        uint32_t ddr3_avm_base = 0x3E000000;
-        uint32_t ddr3_span = 0x02000000;  /* 32 MB default */
+        uint32_t ddr3_base = 0x24000000;
+        uint32_t ddr3_avm_base = 0x24000000;
+        uint32_t ddr3_span = 0x1C000000;
         const char *s;
         if ((s = getenv("BT_FPGA_DDR3_BASE")) != NULL)
             ddr3_base = (uint32_t)strtoul(s, NULL, 0);
@@ -2258,8 +2263,12 @@ int bt_load_model(bt_model_t* model, const char* path) {
         if ((s = getenv("BT_FPGA_DDR3_SPAN")) != NULL)
             ddr3_span = (uint32_t)strtoul(s, NULL, 0);
         if (bt_fpga_init(ddr3_base, ddr3_avm_base, ddr3_span) == 0) {
-            bt_fpga_prepare_layout(model);
-            fprintf(stderr, "biturbo: FPGA T-MAC accelerator ready\n");
+            if (bt_fpga_prepare_layout(model) == 0) {
+                fprintf(stderr, "biturbo: FPGA T-MAC accelerator ready\n");
+            } else {
+                fprintf(stderr, "biturbo: FPGA layout init failed, using CPU path\n");
+                bt_fpga_cleanup();
+            }
         } else {
             fprintf(stderr, "biturbo: FPGA init failed, using CPU path\n");
         }

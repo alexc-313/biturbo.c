@@ -17,7 +17,7 @@ SRCS       = main.c biturbo.c
 OBJS       = $(SRCS:.c=.o)
 PACK_OBJS  = pack_btpk.o biturbo.o
 
-.PHONY: all clean debug fpga pack
+.PHONY: all clean debug fpga pack cma-module cma-clean
 
 all: $(TARGET) $(PACKER)
 
@@ -38,9 +38,19 @@ debug: clean $(TARGET) $(PACKER)
 FPGA_CC     ?= arm-linux-gnueabihf-gcc
 FPGA_CFLAGS  = -std=gnu99 -O2 -Wall -Wextra -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard -DBT_FPGA -DNDEBUG
 FPGA_LDFLAGS = -lm
+KDIR        ?= /lib/modules/$(shell uname -r)/build
+# Linux 4.14 arm hard-float toolchains can mis-detect ARMv7 during cc-option
+# probing and fall back to -march=armv5t unless we force the module build flags.
+CMA_KCFLAGS ?= -march=armv7-a -Wa,-march=armv7-a -mfpu=vfp
 
 fpga:
 	$(FPGA_CC) $(FPGA_CFLAGS) -o biturbo_fpga main.c biturbo.c $(FPGA_LDFLAGS)
+
+cma-module:
+	$(MAKE) -C $(KDIR) M=$(CURDIR)/kernel KCFLAGS="$(CMA_KCFLAGS)" modules
+
+cma-clean:
+	$(MAKE) -C $(KDIR) M=$(CURDIR)/kernel KCFLAGS="$(CMA_KCFLAGS)" clean
 
 clean:
 	rm -f $(OBJS) $(PACK_OBJS) $(TARGET) $(PACKER) biturbo_fpga

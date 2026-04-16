@@ -4,7 +4,7 @@ Zero-dependency BitNet 1.58-bit inference engine in C with TurboQuant KV cache.
 
 ## What it does
 
-Runs Microsoft's [BitNet-b1.58-2B-4T](https://huggingface.co/microsoft/BitNet-b1.58-2B-4T) model directly from GGUF files. All 15 inference stages implemented from scratch in ~1500 lines of portable C99:
+Runs Microsoft's [BitNet-b1.58-2B-4T](https://huggingface.co/microsoft/BitNet-b1.58-2B-4T) model directly from GGUF files. The full inference path is implemented from scratch in portable C99:
 
 | Stage | Component | Implementation |
 |-------|-----------|----------------|
@@ -16,7 +16,7 @@ Runs Microsoft's [BitNet-b1.58-2B-4T](https://huggingface.co/microsoft/BitNet-b1
 | 6 | BitLinear GEMM | INT8 x ternary accumulation |
 | 7 | Q/K/V projection | Separate matrices |
 | 8 | RoPE | Rotary position embedding (theta=500k) |
-| 9 | KV cache | **TurboQuant 4-bit** (RHT + Lloyd-Max + QJL) |
+| 9 | KV cache | TurboQuant 4-bit (RHT + Lloyd-Max + QJL) |
 | 10 | Attention | GQA (20 query / 5 KV heads) |
 | 11 | Sub-norm + output | RMS norm + BitLinear projection |
 | 12 | FFN gate | SqReLU-gated GLU |
@@ -26,177 +26,259 @@ Runs Microsoft's [BitNet-b1.58-2B-4T](https://huggingface.co/microsoft/BitNet-b1
 
 ## TurboQuant KV cache
 
-The KV cache uses the full [TurboQuant](https://arxiv.org/abs/2504.19874) pipeline instead of naive uniform quantization:
+The KV cache uses the full [TurboQuant](https://arxiv.org/abs/2504.19874) pipeline instead of naive uniform quantization.
 
-**Quantize** (K and V at each position):
-1. L2 normalize the vector
-2. Random Hadamard Transform (RHT) to decorrelate channels
-3. Lloyd-Max 3-bit codebook quantization (8 optimal centroids for N(0,1))
-4. QJL 1-bit sign hash on quantization residual
+Quantization path for each K/V vector:
 
-**K attention** (two-stage inner product estimation):
-- RHT(query) and QJL projection pre-computed once per query head
-- Stage 1: codebook dot product in rotated space
-- Stage 2: QJL XNOR correction: `(2*agree - d) * ||r|| * sqrt(pi/2) / d`
-- Final score: `||k|| * (mse_dot + qjl_correction)`
+1. L2 normalize the vector.
+2. Apply a Random Hadamard Transform (RHT) to decorrelate channels.
+3. Quantize with a Lloyd-Max 3-bit codebook.
+4. Store a 1-bit QJL sign hash for the residual.
 
-**V dequant** (MSE-only point-wise reconstruction):
-- Codebook lookup in rotated space -> inverse RHT -> scale by norm
+Attention-time reconstruction:
 
-72 bytes per 128-element block (4.5 bits/element). Provably unbiased inner product estimation.
+- K attention uses a two-stage inner product estimate in rotated space.
+- V reconstruction uses MSE-oriented pointwise dequantization.
+- Storage is 72 bytes per 128-element block, or 4.5 bits per element.
 
 ## Build
 
+Host build:
+
 ```bash
 make
+make debug
 ```
 
-Requires only a C99 compiler. No dependencies. ARM NEON auto-detected on Apple Silicon / aarch64.
-
-```bash
-make debug    # with AddressSanitizer + UBSan
-```
+This requires only a C99 compiler. No extra runtime dependencies are needed.
 
 ## Download model
 
-The engine loads GGUF files with I2_S (1.58-bit ternary) weights. Download the official BitNet model:
+The engine loads GGUF files with I2_S (1.58-bit ternary) weights.
 
 ```bash
-# Install huggingface CLI if needed
 pip install huggingface-hub
 
-# Download the GGUF model (~1.1 GB)
 huggingface-cli download microsoft/BitNet-b1.58-2B-4T-gguf \
     --include "ggml-model-i2_s.gguf" \
     --local-dir model/
 ```
 
-Or convert from the BF16 weights using Microsoft's [BitNet](https://github.com/microsoft/BitNet) conversion tools:
+Or convert from Microsoft's BF16 checkpoint:
 
 ```bash
-# Download BF16 weights
 huggingface-cli download microsoft/bitnet-b1.58-2B-4T-bf16 --local-dir model-bf16/
-
-# Convert to GGUF I2_S (requires BitNet repo)
 python BitNet/utils/convert-ms-to-gguf-bitnet.py model-bf16/ --outtype i2_s
 ```
 
 ## Pre-pack GGUF for FPGA (.btpk)
 
-`pack_btpk` is an offline pre-packer that converts a GGUF model into a
-standalone `.btpk` file whose ternary weights are already engine-striped for
-the DE10-Nano T-MAC accelerator.
+`pack_btpk` converts a GGUF model into a standalone `.btpk` file whose ternary weight blobs are already striped for the DE10-Nano T-MAC accelerator.
 
-Build it with the rest of the project:
+Build the packer:
 
 ```bash
 make
-# or: make pack_btpk
 ```
 
-Convert a GGUF model into `.btpk`:
+Convert GGUF to `.btpk`:
 
 ```bash
-./pack_btpk model/ggml-model-i2_s.gguf model/ggml-model-i2_s.btpk
+./pack_btpk model/ggml-model-i2_s.gguf model/ggml-model.btpk
 ```
 
-This loads the GGUF model, runs the normal `tmac_repack` path once offline,
-and writes tokenizer data, token embeddings, norms, and pre-striped weight
-blobs into the output file.
-
-Use the resulting `.btpk` file only with the FPGA build on the DE10-Nano:
-
-```bash
-make fpga
-# copy biturbo_fpga to the board, then run it there
-./biturbo_fpga model/ggml-model-i2_s.btpk -p "Where is Tokyo?" -n 64
-```
-
-The CPU-only `./biturbo` executable expects a GGUF model and will reject
-`.btpk` files.
+The `.btpk` format stores tokenizer data, token embeddings, norms, and pre-striped FPGA weight blobs so the board does not need to repack weights at runtime.
 
 ## Run
 
+CPU path:
+
 ```bash
 ./biturbo model/ggml-model-i2_s.gguf -p "Where is Tokyo?" -n 64
-
-./biturbo model/ggml-model-i2_s.gguf -p "Once upon a time" -n 128 -t 0.7
-
 ./biturbo model/ggml-model-i2_s.gguf -p "Explain quantum computing" -n 256 -t 0.0
 ```
 
-## DE10-Nano FPGA memory carveout
+FPGA path:
 
-When building `biturbo_fpga` for the DE10-Nano, the FPGA driver expects a
-reserved DDR3 window outside Linux's normal page allocator. The default
-carveout is the top 32 MB of HPS DDR:
-
-```text
-base = 0x3E000000
-span = 0x02000000
+```bash
+make fpga
+./biturbo_fpga model/ggml-model.btpk -p "hi" -n 6
 ```
 
-The matching `reserved-memory` node lives in [`soc_system.dts`](../soc_system.dts).
-After changing the device tree, rebuild/copy the DTB that your board actually
-boots, then verify on target:
+The CPU-only `./biturbo` executable expects GGUF and will reject `.btpk`.
+
+## DE10-Nano FPGA path
+
+The FPGA build now supports two memory backends:
+
+- `devmem`: legacy fixed DDR carveout through `/dev/mem`
+- `cma`: Linux CMA-backed DMA allocation through `/dev/biturbo-cma`
+
+The CMA backend is the recommended path for persistent `.btpk` inference. Each weight blob is allocated as its own DMA buffer, copied into DDR once during model load, and then reused across tokens. This removes the old per-token layer streaming cost.
+
+### FPGA userspace build
+
+```bash
+make fpga
+```
+
+This builds `biturbo_fpga` for the Cortex-A9 on DE10-Nano with `BT_FPGA` enabled.
+
+### Runtime backend selection
+
+`biturbo_fpga` checks `BT_FPGA_MEM_BACKEND`:
+
+- `auto` or unset: try CMA first, then fall back to legacy `devmem`
+- `cma`: require `/dev/biturbo-cma`
+- `devmem`: force the old carveout backend
+
+If the board has already been switched to a reusable CMA pool in the device tree, prefer `BT_FPGA_MEM_BACKEND=cma` so the process does not silently fall back to raw `/dev/mem` access against Linux-managed RAM.
+
+### CMA driver build
+
+Build on target, or build against a matching DE10-Nano kernel tree:
+
+```bash
+make fpga
+make cma-module KDIR=/lib/modules/$(uname -r)/build
+sudo insmod kernel/biturbo_cma.ko
+ls -l /dev/biturbo-cma
+```
+
+For Windows + WSL cross-builds:
+
+```powershell
+wsl bash -lc "cd /mnt/c/intelFPGA_lite/18.1/ghrd_bitnet/biturbo.c && make cma-module KDIR=~/src/linux-socfpga-4.14.73-ltsi ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf-"
+```
+
+The repository `Makefile` injects the ARMv7 module flags needed for older 4.14 ARM builds with modern hard-float GCC toolchains.
+
+### Device tree
+
+The matching CMA pool and platform device live in [`soc_system.dts`](../soc_system.dts). The default pool in this repo is sized for persistent BitNet weights:
+
+```text
+base = 0x24000000
+span = 0x1C000000
+```
+
+Relevant node shape:
+
+```dts
+reserved-memory {
+    #address-cells = <1>;
+    #size-cells = <1>;
+    ranges;
+
+    biturbo_fpga_reserved: biturbo-fpga@24000000 {
+        reg = <0x24000000 0x1c000000>;
+        compatible = "shared-dma-pool";
+        reusable;
+        alignment = <0x00001000>;
+    };
+};
+
+biturbo_cma {
+    compatible = "biturbo,cma-pool";
+    memory-region = <&biturbo_fpga_reserved>;
+    dma-coherent;
+    status = "okay";
+};
+```
+
+After updating the DTB that the board actually boots, verify on target:
 
 ```bash
 ls /proc/device-tree/reserved-memory/
-hexdump -Cv /proc/device-tree/reserved-memory/biturbo-fpga@3e000000/reg
-grep -i -A3 -B1 3e000000 /proc/iomem
+hexdump -Cv /proc/device-tree/reserved-memory/biturbo-fpga@24000000/reg
+grep -i -A3 -B1 24000000 /proc/iomem
 ```
 
-If the board is still booting an older DTB, `biturbo_fpga` may fall back to a
-raw `/dev/mem` mapping and the FPGA can end up DMA-ing into Linux-owned RAM.
+### Example run
 
-### Options
+```bash
+BT_FPGA_MEM_BACKEND=cma sudo ./biturbo_fpga model/ggml-model.btpk -p "hi" -n 6
+```
+
+Expected persistent-weight log pattern:
+
+```text
+[FPGA] T-MAC accelerator bound: backend=cma, DMA via /dev/biturbo-cma
+[FPGA] layout (cma, btpk): weights=<weight_bytes>, act=<act_bytes>, res=<res_bytes>
+[FPGA] preloaded btpk weights once: 440647680 bytes across 30 layers
+```
+
+If you still see a 32 MB DDR span warning or a "streaming layer window" message, the board is still using the old carveout configuration.
+
+### CLI options
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-p` | `"Hello"` | Input prompt |
 | `-n` | 256 | Max tokens to generate |
-| `-t` | 0.8 | Temperature (0.0 = greedy) |
+| `-t` | 0.8 | Temperature (`0.0` = greedy) |
 | `-k` | 0.9 | Top-p nucleus sampling |
 | `-s` | time | RNG seed |
 
 ## Architecture
 
-```
-biturbo.h    Types, config, API (bt_kv_block_t, bt_i2s_weight_t, etc.)
-biturbo.c    Full inference engine (~1500 lines)
-main.c       CLI runner
-Makefile     Build with NEON auto-detection
+```text
+biturbo.h             Types, config, API
+biturbo.c             Full inference engine and profiling output
+biturbo_fpga.h        FPGA backend with CMA/devmem support
+biturbo_cma_ioctl.h   Shared userspace/kernel ioctl ABI
+kernel/biturbo_cma.c  CMA misc driver
+main.c                CLI runner
+Makefile              Userspace + kernel-module build entry points
 ```
 
-### BitNet-b1.58-2B-4T model specs
+## Model specs
+
+BitNet-b1.58-2B-4T:
 
 | Parameter | Value |
 |-----------|-------|
 | Hidden dim | 2560 |
 | Layers | 30 |
-| Attention heads | 20 (query) / 5 (KV) |
+| Attention heads | 20 query / 5 KV |
 | Head dim | 128 |
 | FFN dim | 6912 |
-| Vocab size | 128,256 |
-| Context length | 4,096 |
+| Vocab size | 128256 |
+| Context length | 4096 |
 | Weight format | 1.58-bit ternary (I2_S) |
-| Parameters | ~2.4B |
-| Model size | ~1.1 GB (GGUF) |
+| Parameters | about 2.4B |
 
 ## Performance
 
-Single-threaded on Apple M1:
+Host reference, single-threaded on Apple M1:
 
 | Metric | Value |
 |--------|-------|
-| Speed | ~1.3 tok/s |
-| Model memory | ~1.1 GB (mmap'd) |
-| KV cache | ~80 MB (30 layers x 5 heads x 4096 positions) |
-| Runtime buffers | ~15 MB |
+| Speed | about 1.3 tok/s |
+| Model memory | about 1.1 GB mmap'd |
+| KV cache | about 80 MB |
+| Runtime buffers | about 15 MB |
+
+### DE10-Nano FPGA profiling
+
+Measured with `.btpk`, prompt `hi`, generating 5 tokens:
+
+| Configuration | Total | Transformer layers | LM head | Sampling |
+|---------------|-------|--------------------|---------|----------|
+| Legacy streaming layer window | 78.33 s | 30.02 s (6.00 s/token) | 47.68 s (9.54 s/token) | 0.63 s (0.1262 s/token) |
+| CMA persistent weights in DDR | 56.38 s | 8.08 s (1.62 s/token) | 47.67 s (9.53 s/token) | 0.63 s (0.1260 s/token) |
+
+The CMA-backed persistent weight path cuts transformer layer time by about 3.7x. After that improvement, the dominant bottleneck on DE10-Nano becomes the CPU-side LM head, which is still around 9.5 seconds per generated token.
+
+The built-in profile summary prints:
+
+```text
+biturbo: profile (generated tokens): layers=8.08s (1.62 s/token), lm_head=47.67s (9.53 s/token), sampling=0.63s (0.1260 s/token)
+```
 
 ## References
 
-- [BitNet-b1.58-2B-4T](https://huggingface.co/microsoft/BitNet-b1.58-2B-4T) — Microsoft's official 1.58-bit model
-- [BitNet: Scaling 1-bit Transformers](https://arxiv.org/abs/2310.11453) — BitNet architecture paper
-- [The Era of 1-bit LLMs](https://arxiv.org/abs/2402.17764) — BitNet b1.58 paper
-- [TurboQuant](https://arxiv.org/abs/2504.19874) — KV cache quantization with RHT + QJL
+- [BitNet-b1.58-2B-4T](https://huggingface.co/microsoft/BitNet-b1.58-2B-4T) - Microsoft's official 1.58-bit model
+- [BitNet: Scaling 1-bit Transformers](https://arxiv.org/abs/2310.11453) - BitNet architecture paper
+- [The Era of 1-bit LLMs](https://arxiv.org/abs/2402.17764) - BitNet b1.58 paper
+- [TurboQuant](https://arxiv.org/abs/2504.19874) - KV cache quantization with RHT + QJL

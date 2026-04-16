@@ -1,27 +1,30 @@
 /*
- * biturbo_fpga.h -- T-MAC FPGA accelerator driver for biturbo.c
+ * biturbo_fpga.h -- T-MAC FPGA accelerator support for biturbo.c
  *
- * Offloads T-MAC GEMV to DE10-Nano FPGA (TMacAccelerator).
- * The FPGA builds LUTs from INT8 activations internally, streams
- * T-MAC weights from DDR3, and returns INT32 accumulator results.
+ * Two memory backends are supported:
+ *   1. legacy /dev/mem DDR carveout
+ *   2. CMA-backed per-buffer allocation through /dev/biturbo-cma
  *
- * Zero extra CPU memory: weights are repacked directly from software
- * tmac format to DDR3 on each layer switch (~14 MB memcpy per layer).
+ * The CMA path allocates one DMA buffer per weight blob plus dedicated
+ * activation/result scratch buffers. Weights are copied once at model load,
+ * then inference only updates FPGA base registers.
  */
 
 #ifndef BITURBO_FPGA_H
 #define BITURBO_FPGA_H
 
 #include "biturbo.h"
+#include "biturbo_cma_ioctl.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <string.h>
-#include <math.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -30,7 +33,7 @@
  * ================================================================ */
 
 #define BT_FPGA_LW_BRIDGE_BASE  0xFF200000
-#define BT_FPGA_LW_BRIDGE_SPAN  0x00200000  /* 2 MB */
+#define BT_FPGA_LW_BRIDGE_SPAN  0x00200000
 
 #define BT_REG_CTRL           0x00
 #define BT_REG_STATUS         0x04
@@ -39,7 +42,7 @@
 #define BT_REG_DIM_K          0x10
 #define BT_REG_SIGN_BASE      0x14
 #define BT_REG_PERF_CYCLES    0x18
-#define BT_REG_DIM_N3         0x1C  /* HPS-supplied K/3 to avoid on-chip divider */
+#define BT_REG_DIM_N3         0x1C
 #define BT_REG_ACT_DDR3_BASE  0x28
 #define BT_REG_RES_DDR3_BASE  0x2C
 
@@ -48,31 +51,40 @@
 
 #define BT_FPGA_MAX_DIM_M     8192
 #define BT_FPGA_MAX_DIM_K     8192
-#define BT_FPGA_NUM_ENGINES   32    /* parallel lookup engines */
-#define BT_FPGA_BEAT_BYTES    16    /* 128-bit DDR3 bus = 16 bytes */
+#define BT_FPGA_NUM_ENGINES   32
+#define BT_FPGA_BEAT_BYTES    16
+#define BT_FPGA_WEIGHTS_PER_LAYER 7
 
 /* ================================================================
- * Global state
+ * Backend state
  * ================================================================ */
 
-static int               bt_fpga_fd = -1;
-static volatile uint32_t *bt_fpga_regs = NULL;
-static volatile uint8_t  *bt_fpga_ddr3 = NULL;
-static uint32_t          bt_fpga_ddr3_cpu_phys = 0;
-static uint32_t          bt_fpga_ddr3_avm_base = 0;
-static uint32_t          bt_fpga_ddr3_span = 0;
-static uint32_t          bt_fpga_act_off = 0;
-static uint32_t          bt_fpga_res_off = 0;
-static int               bt_fpga_cached_layer = -1;
-static int               bt_fpga_timeout_us = 2000000;
-static int32_t          *bt_fpga_raw_buf = NULL;
+typedef enum {
+    BT_FPGA_MEM_NONE = 0,
+    BT_FPGA_MEM_DEVMEM = 1,
+    BT_FPGA_MEM_CMA = 2
+} bt_fpga_mem_backend_t;
 
-/* Per-weight DDR3 offset */
+typedef enum {
+    BT_FPGA_MEM_PREF_AUTO = 0,
+    BT_FPGA_MEM_PREF_DEVMEM = 1,
+    BT_FPGA_MEM_PREF_CMA = 2
+} bt_fpga_mem_pref_t;
+
 typedef struct {
-    uint32_t nib_off;
-    uint32_t sign_off;
-    int      nib_stride;   /* bytes per row in nibble array */
-    int      sign_stride;  /* bytes per row in sign array */
+    int               is_cma;
+    int               handle;
+    size_t            size;
+    uint32_t          dma_addr;
+    uint64_t          mmap_offset;
+    volatile uint8_t *cpu;
+} bt_fpga_dma_buf_t;
+
+typedef struct {
+    bt_fpga_dma_buf_t nib;
+    bt_fpga_dma_buf_t sign;
+    int               nib_stride;
+    int               sign_stride;
 } bt_fpga_wt_loc_t;
 
 typedef struct {
@@ -80,11 +92,25 @@ typedef struct {
     bt_fpga_wt_loc_t w_gate, w_up, w_down;
 } bt_fpga_layer_loc_t;
 
+static int                bt_fpga_mem_fd = -1;
+static int                bt_fpga_cma_fd = -1;
+static volatile uint32_t *bt_fpga_regs = NULL;
+static volatile uint8_t  *bt_fpga_ddr3 = NULL;
+static bt_fpga_mem_backend_t bt_fpga_mem_backend = BT_FPGA_MEM_NONE;
+static uint32_t           bt_fpga_ddr3_cpu_phys = 0;
+static uint32_t           bt_fpga_ddr3_avm_base = 0;
+static uint32_t           bt_fpga_ddr3_span = 0;
+static bt_fpga_dma_buf_t  bt_fpga_act_buf;
+static bt_fpga_dma_buf_t  bt_fpga_res_buf;
+static int                bt_fpga_cached_layer = -1;
+static int                bt_fpga_timeout_us = 2000000;
+static int32_t           *bt_fpga_raw_buf = NULL;
 static bt_fpga_layer_loc_t *bt_fpga_layer_locs = NULL;
-static int bt_fpga_n_layers = 0;
+static int                bt_fpga_n_layers = 0;
+static size_t             bt_fpga_weight_bytes = 0;
 
 /* ================================================================
- * Low-level register access
+ * Helpers
  * ================================================================ */
 
 static inline void bt_fpga_reg_write(uint32_t offset, uint32_t val) {
@@ -95,65 +121,294 @@ static inline uint32_t bt_fpga_reg_read(uint32_t offset) {
     return ((volatile uint32_t *)bt_fpga_regs)[offset / 4];
 }
 
+static size_t bt_fpga_align_up_size(size_t value, size_t align) {
+    return (value + align - 1) & ~(align - 1);
+}
+
+static const char *bt_fpga_backend_name(bt_fpga_mem_backend_t backend) {
+    switch (backend) {
+    case BT_FPGA_MEM_DEVMEM: return "devmem";
+    case BT_FPGA_MEM_CMA: return "cma";
+    default: return "none";
+    }
+}
+
+static bt_fpga_mem_pref_t bt_fpga_get_mem_pref(void) {
+    const char *s = getenv("BT_FPGA_MEM_BACKEND");
+
+    if (!s || !*s || strcmp(s, "auto") == 0)
+        return BT_FPGA_MEM_PREF_AUTO;
+    if (strcmp(s, "devmem") == 0 || strcmp(s, "carveout") == 0)
+        return BT_FPGA_MEM_PREF_DEVMEM;
+    if (strcmp(s, "cma") == 0)
+        return BT_FPGA_MEM_PREF_CMA;
+
+    fprintf(stderr,
+            "[FPGA] unknown BT_FPGA_MEM_BACKEND='%s', using auto\n", s);
+    return BT_FPGA_MEM_PREF_AUTO;
+}
+
+static int bt_fpga_dma_buf_valid(const bt_fpga_dma_buf_t *buf) {
+    return buf && buf->cpu && buf->size != 0;
+}
+
+static void bt_fpga_zero_dma_buf(bt_fpga_dma_buf_t *buf) {
+    if (!buf)
+        return;
+    memset(buf, 0, sizeof(*buf));
+    buf->handle = -1;
+}
+
+static void bt_fpga_free_dma_buf(bt_fpga_dma_buf_t *buf) {
+    biturbo_cma_free_req_t req;
+
+    if (!bt_fpga_dma_buf_valid(buf))
+        return;
+
+    if (buf->is_cma) {
+        munmap((void *)buf->cpu, buf->size);
+        if (bt_fpga_cma_fd >= 0 && buf->handle >= 0) {
+            memset(&req, 0, sizeof(req));
+            req.handle = (uint32_t)buf->handle;
+            if (ioctl(bt_fpga_cma_fd, BITURBO_CMA_IOCTL_FREE, &req) != 0)
+                perror("[FPGA] ioctl FREE");
+        }
+    }
+
+    bt_fpga_zero_dma_buf(buf);
+}
+
+static void bt_fpga_free_weight_loc(bt_fpga_wt_loc_t *loc) {
+    if (!loc)
+        return;
+    bt_fpga_free_dma_buf(&loc->nib);
+    bt_fpga_free_dma_buf(&loc->sign);
+    loc->nib_stride = 0;
+    loc->sign_stride = 0;
+}
+
+static void bt_fpga_free_layer_locs(void) {
+    int l;
+
+    if (!bt_fpga_layer_locs)
+        return;
+
+    for (l = 0; l < bt_fpga_n_layers; l++) {
+        bt_fpga_free_weight_loc(&bt_fpga_layer_locs[l].wq);
+        bt_fpga_free_weight_loc(&bt_fpga_layer_locs[l].wk);
+        bt_fpga_free_weight_loc(&bt_fpga_layer_locs[l].wv);
+        bt_fpga_free_weight_loc(&bt_fpga_layer_locs[l].wo);
+        bt_fpga_free_weight_loc(&bt_fpga_layer_locs[l].w_gate);
+        bt_fpga_free_weight_loc(&bt_fpga_layer_locs[l].w_up);
+        bt_fpga_free_weight_loc(&bt_fpga_layer_locs[l].w_down);
+    }
+
+    free(bt_fpga_layer_locs);
+    bt_fpga_layer_locs = NULL;
+    bt_fpga_n_layers = 0;
+}
+
+static void bt_fpga_reset_layout_state(void) {
+    bt_fpga_free_layer_locs();
+    bt_fpga_free_dma_buf(&bt_fpga_act_buf);
+    bt_fpga_free_dma_buf(&bt_fpga_res_buf);
+    free(bt_fpga_raw_buf);
+    bt_fpga_raw_buf = NULL;
+    bt_fpga_cached_layer = -1;
+    bt_fpga_weight_bytes = 0;
+}
+
+static int bt_fpga_map_lw_bridge(void) {
+    volatile void *lw;
+
+    bt_fpga_mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
+    if (bt_fpga_mem_fd < 0) {
+        perror("bt_fpga_init: open /dev/mem");
+        return -1;
+    }
+
+    lw = mmap(NULL, BT_FPGA_LW_BRIDGE_SPAN,
+              PROT_READ | PROT_WRITE, MAP_SHARED,
+              bt_fpga_mem_fd, BT_FPGA_LW_BRIDGE_BASE);
+    if (lw == MAP_FAILED) {
+        perror("bt_fpga_init: mmap lw_bridge");
+        close(bt_fpga_mem_fd);
+        bt_fpga_mem_fd = -1;
+        return -1;
+    }
+    bt_fpga_regs = (volatile uint32_t *)lw;
+    return 0;
+}
+
+static int bt_fpga_try_open_cma(void) {
+    bt_fpga_cma_fd = open(BITURBO_CMA_DEVICE, O_RDWR | O_SYNC);
+    if (bt_fpga_cma_fd < 0)
+        return -1;
+
+    bt_fpga_mem_backend = BT_FPGA_MEM_CMA;
+    fprintf(stderr,
+            "[FPGA] T-MAC accelerator bound: backend=%s, DMA via %s\n",
+            bt_fpga_backend_name(bt_fpga_mem_backend), BITURBO_CMA_DEVICE);
+    return 0;
+}
+
+static int bt_fpga_try_map_devmem(uint32_t ddr3_cpu_phys,
+                                  uint32_t ddr3_avm_base,
+                                  uint32_t ddr3_span) {
+    bt_fpga_ddr3 = (volatile uint8_t *)mmap(NULL, ddr3_span,
+                    PROT_READ | PROT_WRITE, MAP_SHARED,
+                    bt_fpga_mem_fd, ddr3_cpu_phys);
+    if (bt_fpga_ddr3 == MAP_FAILED) {
+        perror("bt_fpga_init: mmap ddr3");
+        bt_fpga_ddr3 = NULL;
+        return -1;
+    }
+
+    bt_fpga_mem_backend = BT_FPGA_MEM_DEVMEM;
+    bt_fpga_ddr3_cpu_phys = ddr3_cpu_phys;
+    bt_fpga_ddr3_avm_base = ddr3_avm_base;
+    bt_fpga_ddr3_span = ddr3_span;
+
+    fprintf(stderr,
+            "[FPGA] T-MAC accelerator bound: backend=%s, CPU DDR3 0x%08X, AVM base 0x%08X, span 0x%X\n",
+            bt_fpga_backend_name(bt_fpga_mem_backend),
+            ddr3_cpu_phys, ddr3_avm_base, ddr3_span);
+    return 0;
+}
+
+static void bt_fpga_make_buf_name(char *dst, size_t dst_sz,
+                                  int layer, const char *weight,
+                                  const char *kind) {
+    if (layer < 0)
+        snprintf(dst, dst_sz, "%s.%s", weight, kind);
+    else
+        snprintf(dst, dst_sz, "l%02d.%s.%s", layer, weight, kind);
+}
+
+static int bt_fpga_alloc_cma_buf(bt_fpga_dma_buf_t *buf,
+                                 size_t size,
+                                 const char *name) {
+    biturbo_cma_alloc_req_t req;
+    void *cpu;
+
+    if (!buf || bt_fpga_cma_fd < 0 || size == 0)
+        return -1;
+
+    memset(&req, 0, sizeof(req));
+    req.size = (uint64_t)size;
+    if (name)
+        snprintf(req.name, sizeof(req.name), "%s", name);
+
+    if (ioctl(bt_fpga_cma_fd, BITURBO_CMA_IOCTL_ALLOC, &req) != 0) {
+        perror("[FPGA] ioctl ALLOC");
+        return -1;
+    }
+
+    if (req.dma_addr > 0xFFFFFFFFULL) {
+        fprintf(stderr, "[FPGA] DMA address 0x%08X does not fit 32-bit FPGA regs\n",
+                (unsigned)req.dma_addr);
+        goto fail;
+    }
+
+    cpu = mmap(NULL, (size_t)req.size, PROT_READ | PROT_WRITE, MAP_SHARED,
+               bt_fpga_cma_fd, (off_t)req.mmap_offset);
+    if (cpu == MAP_FAILED) {
+        perror("[FPGA] mmap CMA buffer");
+        goto fail;
+    }
+
+    bt_fpga_zero_dma_buf(buf);
+    buf->is_cma = 1;
+    buf->handle = (int)req.handle;
+    buf->size = (size_t)req.size;
+    buf->dma_addr = (uint32_t)req.dma_addr;
+    buf->mmap_offset = req.mmap_offset;
+    buf->cpu = (volatile uint8_t *)cpu;
+    return 0;
+
+fail:
+    {
+        biturbo_cma_free_req_t free_req;
+        memset(&free_req, 0, sizeof(free_req));
+        free_req.handle = req.handle;
+        (void)ioctl(bt_fpga_cma_fd, BITURBO_CMA_IOCTL_FREE, &free_req);
+    }
+    return -1;
+}
+
+static void bt_fpga_assign_devmem_buf(bt_fpga_dma_buf_t *buf,
+                                      uint32_t offset,
+                                      size_t size) {
+    bt_fpga_zero_dma_buf(buf);
+    buf->is_cma = 0;
+    buf->handle = -1;
+    buf->size = size;
+    buf->dma_addr = bt_fpga_ddr3_avm_base + offset;
+    buf->cpu = bt_fpga_ddr3 + offset;
+}
+
 /* ================================================================
- * Init / Cleanup
+ * Init / cleanup
  * ================================================================ */
 
 static int bt_fpga_init(uint32_t ddr3_cpu_phys,
                         uint32_t ddr3_avm_base,
                         uint32_t ddr3_span) {
-    bt_fpga_fd = open("/dev/mem", O_RDWR | O_SYNC);
-    if (bt_fpga_fd < 0) {
-        perror("bt_fpga_init: open /dev/mem");
-        return -1;
-    }
-
-    volatile void *lw = mmap(NULL, BT_FPGA_LW_BRIDGE_SPAN,
-                             PROT_READ | PROT_WRITE, MAP_SHARED,
-                             bt_fpga_fd, BT_FPGA_LW_BRIDGE_BASE);
-    if (lw == MAP_FAILED) {
-        perror("bt_fpga_init: mmap lw_bridge");
-        close(bt_fpga_fd);
-        return -1;
-    }
-    bt_fpga_regs = (volatile uint32_t *)lw;
-
-    bt_fpga_ddr3 = (volatile uint8_t *)mmap(NULL, ddr3_span,
-                    PROT_READ | PROT_WRITE, MAP_SHARED,
-                    bt_fpga_fd, ddr3_cpu_phys);
-    if (bt_fpga_ddr3 == MAP_FAILED) {
-        perror("bt_fpga_init: mmap ddr3");
-        munmap((void *)lw, BT_FPGA_LW_BRIDGE_SPAN);
-        close(bt_fpga_fd);
-        return -1;
-    }
+    bt_fpga_mem_pref_t pref;
 
     bt_fpga_ddr3_cpu_phys = ddr3_cpu_phys;
     bt_fpga_ddr3_avm_base = ddr3_avm_base;
     bt_fpga_ddr3_span = ddr3_span;
+    bt_fpga_mem_backend = BT_FPGA_MEM_NONE;
+    bt_fpga_ddr3 = NULL;
     bt_fpga_cached_layer = -1;
 
-    fprintf(stderr,
-            "[FPGA] T-MAC accelerator bound: CPU DDR3 0x%08X, AVM base 0x%08X, span 0x%X\n",
-            ddr3_cpu_phys, ddr3_avm_base, ddr3_span);
+    if (bt_fpga_map_lw_bridge() != 0)
+        return -1;
+
+    pref = bt_fpga_get_mem_pref();
+    if (pref != BT_FPGA_MEM_PREF_DEVMEM && bt_fpga_try_open_cma() == 0)
+        return 0;
+
+    if (pref == BT_FPGA_MEM_PREF_CMA) {
+        fprintf(stderr,
+                "[FPGA] BT_FPGA_MEM_BACKEND=cma but %s is unavailable\n",
+                BITURBO_CMA_DEVICE);
+        munmap((void *)bt_fpga_regs, BT_FPGA_LW_BRIDGE_SPAN);
+        close(bt_fpga_mem_fd);
+        bt_fpga_regs = NULL;
+        bt_fpga_mem_fd = -1;
+        return -1;
+    }
+
+    if (bt_fpga_try_map_devmem(ddr3_cpu_phys, ddr3_avm_base, ddr3_span) != 0) {
+        munmap((void *)bt_fpga_regs, BT_FPGA_LW_BRIDGE_SPAN);
+        close(bt_fpga_mem_fd);
+        bt_fpga_regs = NULL;
+        bt_fpga_mem_fd = -1;
+        return -1;
+    }
+
     return 0;
 }
 
 static void bt_fpga_cleanup(void) {
-    free(bt_fpga_raw_buf);
-    free(bt_fpga_layer_locs);
-    if (bt_fpga_ddr3 && bt_fpga_ddr3 != MAP_FAILED)
+    bt_fpga_reset_layout_state();
+
+    if (bt_fpga_ddr3)
         munmap((void *)bt_fpga_ddr3, bt_fpga_ddr3_span);
-    if (bt_fpga_regs && bt_fpga_regs != MAP_FAILED)
+    if (bt_fpga_regs)
         munmap((void *)bt_fpga_regs, BT_FPGA_LW_BRIDGE_SPAN);
-    if (bt_fpga_fd >= 0)
-        close(bt_fpga_fd);
-    bt_fpga_fd = -1;
+    if (bt_fpga_cma_fd >= 0)
+        close(bt_fpga_cma_fd);
+    if (bt_fpga_mem_fd >= 0)
+        close(bt_fpga_mem_fd);
+
+    bt_fpga_mem_fd = -1;
+    bt_fpga_cma_fd = -1;
     bt_fpga_regs = NULL;
     bt_fpga_ddr3 = NULL;
-    bt_fpga_raw_buf = NULL;
-    bt_fpga_layer_locs = NULL;
-    bt_fpga_cached_layer = -1;
+    bt_fpga_mem_backend = BT_FPGA_MEM_NONE;
 }
 
 /* ================================================================
@@ -162,39 +417,25 @@ static void bt_fpga_cleanup(void) {
 
 static int bt_fpga_wait_done(void) {
     struct timespec start, now;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    for (unsigned spins = 0; ; spins++) {
-        uint32_t st = bt_fpga_reg_read(BT_REG_STATUS);
-        if (st & 0x2) return 0;
 
-        if ((spins & 0xFF) == 0) {
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            long elapsed = (long)(now.tv_sec - start.tv_sec) * 1000000L +
-                           (long)(now.tv_nsec - start.tv_nsec) / 1000L;
-            if (elapsed >= bt_fpga_timeout_us) {
-                fprintf(stderr, "[FPGA] timeout: STATUS=0x%08X PERF=%u\n",
-                        st, bt_fpga_reg_read(BT_REG_PERF_CYCLES));
-                return -1;
-            }
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for ( ; ; ) {
+        uint32_t st = bt_fpga_reg_read(BT_REG_STATUS);
+        if (st & 0x2)
+            return 0;
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (((long)(now.tv_sec - start.tv_sec) * 1000000L) +
+            ((long)(now.tv_nsec - start.tv_nsec) / 1000L) >= bt_fpga_timeout_us) {
+            fprintf(stderr, "[FPGA] timeout: STATUS=0x%08X PERF=%u\n",
+                    st, bt_fpga_reg_read(BT_REG_PERF_CYCLES));
+            return -1;
         }
     }
 }
 
-/* Dump all registers for debugging */
-static void bt_fpga_dump_regs(const char *tag) {
-    fprintf(stderr, "[FPGA] %s:\n", tag);
-    fprintf(stderr, "  STATUS     = 0x%08X\n", bt_fpga_reg_read(BT_REG_STATUS));
-    fprintf(stderr, "  NIB_BASE   = 0x%08X\n", bt_fpga_reg_read(BT_REG_NIB_BASE));
-    fprintf(stderr, "  DIM_M      = %u\n",     bt_fpga_reg_read(BT_REG_DIM_M));
-    fprintf(stderr, "  DIM_K      = %u\n",     bt_fpga_reg_read(BT_REG_DIM_K));
-    fprintf(stderr, "  SIGN_BASE  = 0x%08X\n", bt_fpga_reg_read(BT_REG_SIGN_BASE));
-    fprintf(stderr, "  PERF_CYCLES= %u\n",     bt_fpga_reg_read(BT_REG_PERF_CYCLES));
-    fprintf(stderr, "  ACT_BASE   = 0x%08X\n", bt_fpga_reg_read(BT_REG_ACT_DDR3_BASE));
-    fprintf(stderr, "  RES_BASE   = 0x%08X\n", bt_fpga_reg_read(BT_REG_RES_DDR3_BASE));
-}
-
 /* ================================================================
- * Compute DDR3 layout sizes for a weight matrix (no allocation)
+ * Layout helpers
  * ================================================================ */
 
 static void bt_fpga_weight_sizes(const bt_tmac_weight_t *tw,
@@ -207,113 +448,154 @@ static void bt_fpga_weight_sizes(const bt_tmac_weight_t *tw,
 
     *nib_stride = tiles_per_row * BT_FPGA_BEAT_BYTES;
     *sign_stride = sign_beats_per_row * BT_FPGA_BEAT_BYTES;
-    *nib_size = (size_t)tw->rows * (*nib_stride);
-    *sign_size = (size_t)tw->rows * (*sign_stride);
+    *nib_size = (size_t)tw->rows * (size_t)(*nib_stride);
+    *sign_size = (size_t)tw->rows * (size_t)(*sign_stride);
 }
 
-/* ================================================================
- * Compute DDR3 offsets for all layers (just arithmetic, no alloc)
- * ================================================================ */
-
-static void bt_fpga_prepare_layout(bt_model_t *model) {
-    int n_layers = model->config.n_layers;
-    bt_fpga_n_layers = n_layers;
-    bt_fpga_layer_locs = (bt_fpga_layer_loc_t *)calloc(n_layers,
-                           sizeof(bt_fpga_layer_loc_t));
-
+static void bt_fpga_model_limits(const bt_model_t *model,
+                                 int *max_k_padded_out,
+                                 int *max_m_out) {
     int max_k = model->config.dim;
-    if (model->config.ffn_dim > max_k) max_k = model->config.ffn_dim;
-    int max_k_padded = ((max_k + 2) / 3) * 3;
     int max_m = model->config.ffn_dim;
-    if (model->config.dim > max_m) max_m = model->config.dim;
 
-    size_t max_layer_size = 0;
+    if (model->config.ffn_dim > max_k)
+        max_k = model->config.ffn_dim;
+    if (model->config.dim > max_m)
+        max_m = model->config.dim;
 
-    for (int l = 0; l < n_layers; l++) {
-        bt_layer_weights_t *lw = &model->weights.layers[l];
-        bt_tmac_weight_t *wts[] = {
-            lw->wq.tmac, lw->wk.tmac, lw->wv.tmac, lw->wo.tmac,
-            lw->w_gate.tmac, lw->w_up.tmac, lw->w_down.tmac
-        };
-        bt_fpga_wt_loc_t *locs[] = {
-            &bt_fpga_layer_locs[l].wq, &bt_fpga_layer_locs[l].wk,
-            &bt_fpga_layer_locs[l].wv, &bt_fpga_layer_locs[l].wo,
-            &bt_fpga_layer_locs[l].w_gate, &bt_fpga_layer_locs[l].w_up,
-            &bt_fpga_layer_locs[l].w_down
-        };
+    *max_k_padded_out = ((max_k + 2) / 3) * 3;
+    *max_m_out = max_m;
+}
 
-        uint32_t offset = 0;
-        for (int i = 0; i < 7; i++) {
-            size_t nsz, ssz;
-            int ns, ss;
-            bt_fpga_weight_sizes(wts[i], &nsz, &ssz, &ns, &ss);
-
-            offset = (offset + BT_FPGA_BEAT_BYTES - 1) & ~(BT_FPGA_BEAT_BYTES - 1);
-            locs[i]->nib_off = offset;
-            locs[i]->nib_stride = ns;
-            offset += (uint32_t)nsz;
-
-            offset = (offset + BT_FPGA_BEAT_BYTES - 1) & ~(BT_FPGA_BEAT_BYTES - 1);
-            locs[i]->sign_off = offset;
-            locs[i]->sign_stride = ss;
-            offset += (uint32_t)ssz;
-        }
-
-        if (offset > max_layer_size)
-            max_layer_size = offset;
+static int bt_fpga_prepare_raw_buf(int max_m) {
+    bt_fpga_raw_buf = (int32_t *)malloc((size_t)max_m * sizeof(int32_t));
+    if (!bt_fpga_raw_buf) {
+        fprintf(stderr, "[FPGA] OOM allocating result scratch\n");
+        return -1;
     }
+    return 0;
+}
 
-    bt_fpga_act_off = (uint32_t)((max_layer_size + 4095) & ~4095UL);
-    bt_fpga_res_off = bt_fpga_act_off + (uint32_t)((max_k_padded + 4095) & ~4095UL);
-    uint32_t total_needed = bt_fpga_res_off + (uint32_t)max_m * 4 + 4096;
+static int bt_fpga_prepare_scratch_cma(int max_k_padded, int max_m) {
+    if (bt_fpga_alloc_cma_buf(&bt_fpga_act_buf,
+                              bt_fpga_align_up_size((size_t)max_k_padded, 4096),
+                              "act") != 0)
+        return -1;
+    if (bt_fpga_alloc_cma_buf(&bt_fpga_res_buf,
+                              bt_fpga_align_up_size((size_t)max_m * sizeof(int32_t), 4096),
+                              "res") != 0)
+        return -1;
+    return 0;
+}
+
+static int bt_fpga_prepare_scratch_devmem(size_t weight_window_bytes,
+                                          int max_k_padded,
+                                          int max_m) {
+    uint32_t act_off;
+    uint32_t res_off;
+    uint32_t total_needed;
+
+    act_off = (uint32_t)bt_fpga_align_up_size(weight_window_bytes, 4096);
+    res_off = act_off +
+              (uint32_t)bt_fpga_align_up_size((size_t)max_k_padded, 4096);
+    total_needed = res_off +
+                   (uint32_t)bt_fpga_align_up_size((size_t)max_m * sizeof(int32_t), 4096);
 
     if (total_needed > bt_fpga_ddr3_span) {
         fprintf(stderr, "[FPGA] WARNING: need %u bytes but DDR3 span is %u\n",
                 total_needed, bt_fpga_ddr3_span);
     }
 
-    bt_fpga_raw_buf = (int32_t *)malloc((size_t)max_m * sizeof(int32_t));
+    bt_fpga_assign_devmem_buf(&bt_fpga_act_buf, act_off, (size_t)max_k_padded);
+    bt_fpga_assign_devmem_buf(&bt_fpga_res_buf, res_off, (size_t)max_m * sizeof(int32_t));
+    return 0;
+}
 
-    fprintf(stderr, "[FPGA] DDR3 layout: weights=%zu, act@0x%X, res@0x%X, total=%u\n",
-            max_layer_size, bt_fpga_act_off, bt_fpga_res_off, total_needed);
+static int bt_fpga_alloc_weight_loc_cma(bt_fpga_wt_loc_t *loc,
+                                        size_t nib_size,
+                                        size_t sign_size,
+                                        int nib_stride,
+                                        int sign_stride,
+                                        int layer,
+                                        const char *weight_name) {
+    char name[BITURBO_CMA_NAME_LEN];
+
+    memset(loc, 0, sizeof(*loc));
+    loc->nib_stride = nib_stride;
+    loc->sign_stride = sign_stride;
+
+    bt_fpga_make_buf_name(name, sizeof(name), layer, weight_name, "nib");
+    if (bt_fpga_alloc_cma_buf(&loc->nib, nib_size, name) != 0)
+        return -1;
+
+    bt_fpga_make_buf_name(name, sizeof(name), layer, weight_name, "sgn");
+    if (bt_fpga_alloc_cma_buf(&loc->sign, sign_size, name) != 0)
+        return -1;
+
+    bt_fpga_weight_bytes += loc->nib.size + loc->sign.size;
+    return 0;
+}
+
+static void bt_fpga_assign_weight_loc_devmem(bt_fpga_wt_loc_t *loc,
+                                             uint32_t *cursor,
+                                             size_t nib_size,
+                                             size_t sign_size,
+                                             int nib_stride,
+                                             int sign_stride) {
+    uint32_t off = *cursor;
+
+    memset(loc, 0, sizeof(*loc));
+    loc->nib_stride = nib_stride;
+    loc->sign_stride = sign_stride;
+
+    off = (uint32_t)bt_fpga_align_up_size(off, BT_FPGA_BEAT_BYTES);
+    bt_fpga_assign_devmem_buf(&loc->nib, off, nib_size);
+    off += (uint32_t)nib_size;
+
+    off = (uint32_t)bt_fpga_align_up_size(off, BT_FPGA_BEAT_BYTES);
+    bt_fpga_assign_devmem_buf(&loc->sign, off, sign_size);
+    off += (uint32_t)sign_size;
+
+    *cursor = off;
 }
 
 /* ================================================================
- * Repack one weight matrix directly from software tmac → DDR3
- *
- * Writes directly to mmap'd DDR3 region. No CPU-side allocation.
+ * Weight preload helpers
  * ================================================================ */
 
-static void bt_fpga_repack_to_ddr3(const bt_tmac_weight_t *tw,
-                                   const bt_fpga_wt_loc_t *loc) {
+static void bt_fpga_repack_weight_to_loc(const bt_tmac_weight_t *tw,
+                                         const bt_fpga_wt_loc_t *loc) {
     int rows = tw->rows;
     int n3_cpu = tw->n3;
     int n3_total = (tw->cols + 2) / 3;
+    uint8_t *nib_base = (uint8_t *)loc->nib.cpu;
+    uint8_t *sign_base = (uint8_t *)loc->sign.cpu;
     int nib_stride = loc->nib_stride;
     int sign_stride = loc->sign_stride;
+    int r;
 
-    uint8_t *nib_base = (uint8_t *)bt_fpga_ddr3 + loc->nib_off;
-    uint8_t *sign_base = (uint8_t *)bt_fpga_ddr3 + loc->sign_off;
+    memset(nib_base, 0, loc->nib.size);
+    memset(sign_base, 0, loc->sign.size);
 
-    /* Zero the destination regions */
-    memset(nib_base, 0, (size_t)rows * nib_stride);
-    memset(sign_base, 0, (size_t)rows * sign_stride);
-
-    for (int r = 0; r < rows; r++) {
+    for (r = 0; r < rows; r++) {
         const uint8_t *nib_row = tw->three_nib + (size_t)r * tw->nib3_stride;
         const uint8_t *sign_row = tw->three_sign + (size_t)r * tw->sign_stride;
-        uint8_t *nib_out = nib_base + (size_t)r * nib_stride;
-        uint8_t *sign_out = sign_base + (size_t)r * sign_stride;
-
-        /* Repack nibbles: software (even g=high nib) → FPGA (even engine=low nib) */
+        uint8_t *nib_out = nib_base + (size_t)r * (size_t)nib_stride;
+        uint8_t *sign_out = sign_base + (size_t)r * (size_t)sign_stride;
         int tiles_per_row = nib_stride / BT_FPGA_BEAT_BYTES;
-        for (int t = 0; t < tiles_per_row; t++) {
-            uint8_t *beat = nib_out + t * BT_FPGA_BEAT_BYTES;
-            for (int e = 0; e < BT_FPGA_NUM_ENGINES; e++) {
+        int t;
+
+        for (t = 0; t < tiles_per_row; t++) {
+            uint8_t *beat = nib_out + (size_t)t * BT_FPGA_BEAT_BYTES;
+            int e;
+
+            for (e = 0; e < BT_FPGA_NUM_ENGINES; e++) {
                 int g = t * BT_FPGA_NUM_ENGINES + e;
                 int nibble = 0;
                 int sign_bit = 0;
-                if (g >= n3_total) break;
+
+                if (g >= n3_total)
+                    break;
 
                 if (g < n3_cpu) {
                     uint8_t packed = nib_row[g / 2];
@@ -327,50 +609,145 @@ static void bt_fpga_repack_to_ddr3(const bt_tmac_weight_t *tw,
                     }
                 }
 
-                int byte_pos = e / 2;
                 if (e & 1)
-                    beat[byte_pos] |= (uint8_t)(nibble << 4);
+                    beat[e / 2] |= (uint8_t)(nibble << 4);
                 else
-                    beat[byte_pos] |= (uint8_t)(nibble & 0x0F);
+                    beat[e / 2] |= (uint8_t)(nibble & 0x0F);
 
                 if (sign_bit) {
                     int tile = g / BT_FPGA_NUM_ENGINES;
                     int eng = g % BT_FPGA_NUM_ENGINES;
                     int sign_beat = tile / 4;
                     int chunk = tile % 4;
-
                     int byte_off = sign_beat * BT_FPGA_BEAT_BYTES + chunk * 4 + eng / 8;
                     sign_out[byte_off] |= (uint8_t)(1 << (eng & 7));
                 }
             }
         }
     }
-    fprintf(stderr, "[FPGA] repack %d\n", rows);
+}
+
+static int bt_fpga_copy_btpk_weight(const btpk_weight_t *w,
+                                    const bt_fpga_wt_loc_t *loc) {
+    if ((size_t)w->nib_size > loc->nib.size || (size_t)w->sign_size > loc->sign.size) {
+        fprintf(stderr, "[FPGA] btpk weight buffer smaller than source blob\n");
+        return -1;
+    }
+
+    memcpy((void *)loc->nib.cpu, w->nib_data, (size_t)w->nib_size);
+    memcpy((void *)loc->sign.cpu, w->sign_data, (size_t)w->sign_size);
+    return 0;
 }
 
 /* ================================================================
- * Compute DDR3 offsets using .btpk pre-striped blob sizes
- *
- * The .btpk file already carries the exact FPGA byte image for each
- * weight. We just assign DDR3 offsets and record sizes; the load
- * path is a plain memcpy per weight — no nibble/sign shuffling.
+ * Layout preparation
  * ================================================================ */
 
-static void bt_fpga_prepare_layout_btpk(bt_model_t *model) {
+static int bt_fpga_prepare_layout(bt_model_t *model) {
     int n_layers = model->config.n_layers;
-    bt_fpga_n_layers = n_layers;
-    bt_fpga_layer_locs = (bt_fpga_layer_loc_t *)calloc(n_layers,
-                           sizeof(bt_fpga_layer_loc_t));
-
-    int max_k = model->config.dim;
-    if (model->config.ffn_dim > max_k) max_k = model->config.ffn_dim;
-    int max_k_padded = ((max_k + 2) / 3) * 3;
-    int max_m = model->config.ffn_dim;
-    if (model->config.dim > max_m) max_m = model->config.dim;
-
+    int max_k_padded;
+    int max_m;
     size_t max_layer_size = 0;
+    int l;
 
-    for (int l = 0; l < n_layers; l++) {
+    bt_fpga_reset_layout_state();
+    bt_fpga_n_layers = n_layers;
+    bt_fpga_layer_locs = (bt_fpga_layer_loc_t *)calloc((size_t)n_layers,
+                           sizeof(bt_fpga_layer_loc_t));
+    if (!bt_fpga_layer_locs) {
+        fprintf(stderr, "[FPGA] OOM allocating layer layout table\n");
+        return -1;
+    }
+
+    bt_fpga_model_limits(model, &max_k_padded, &max_m);
+
+    for (l = 0; l < n_layers; l++) {
+        bt_layer_weights_t *lw = &model->weights.layers[l];
+        bt_tmac_weight_t *wts[] = {
+            lw->wq.tmac, lw->wk.tmac, lw->wv.tmac, lw->wo.tmac,
+            lw->w_gate.tmac, lw->w_up.tmac, lw->w_down.tmac
+        };
+        bt_fpga_wt_loc_t *locs[] = {
+            &bt_fpga_layer_locs[l].wq, &bt_fpga_layer_locs[l].wk,
+            &bt_fpga_layer_locs[l].wv, &bt_fpga_layer_locs[l].wo,
+            &bt_fpga_layer_locs[l].w_gate, &bt_fpga_layer_locs[l].w_up,
+            &bt_fpga_layer_locs[l].w_down
+        };
+        const char *names[] = { "wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down" };
+        uint32_t cursor = 0;
+        int i;
+
+        for (i = 0; i < BT_FPGA_WEIGHTS_PER_LAYER; i++) {
+            size_t nib_size, sign_size;
+            int nib_stride, sign_stride;
+
+            bt_fpga_weight_sizes(wts[i], &nib_size, &sign_size,
+                                 &nib_stride, &sign_stride);
+
+            if (bt_fpga_mem_backend == BT_FPGA_MEM_CMA) {
+                if (bt_fpga_alloc_weight_loc_cma(locs[i], nib_size, sign_size,
+                                                 nib_stride, sign_stride,
+                                                 l, names[i]) != 0)
+                    goto fail;
+                bt_fpga_repack_weight_to_loc(wts[i], locs[i]);
+            } else {
+                bt_fpga_assign_weight_loc_devmem(locs[i], &cursor,
+                                                 nib_size, sign_size,
+                                                 nib_stride, sign_stride);
+            }
+        }
+
+        if ((size_t)cursor > max_layer_size)
+            max_layer_size = cursor;
+    }
+
+    if (bt_fpga_mem_backend == BT_FPGA_MEM_CMA) {
+        if (bt_fpga_prepare_scratch_cma(max_k_padded, max_m) != 0)
+            goto fail;
+    } else {
+        bt_fpga_weight_bytes = max_layer_size;
+        if (bt_fpga_prepare_scratch_devmem(max_layer_size, max_k_padded, max_m) != 0)
+            goto fail;
+    }
+
+    if (bt_fpga_prepare_raw_buf(max_m) != 0)
+        goto fail;
+
+    fprintf(stderr,
+            "[FPGA] layout (%s, GGUF): weights=%zu, act=%zu, res=%zu\n",
+            bt_fpga_backend_name(bt_fpga_mem_backend),
+            bt_fpga_weight_bytes, bt_fpga_act_buf.size, bt_fpga_res_buf.size);
+    if (bt_fpga_mem_backend == BT_FPGA_MEM_CMA) {
+        fprintf(stderr,
+                "[FPGA] preloaded GGUF weights once: %zu bytes across %d layers\n",
+                bt_fpga_weight_bytes, n_layers);
+    }
+    return 0;
+
+fail:
+    bt_fpga_reset_layout_state();
+    return -1;
+}
+
+static int bt_fpga_prepare_layout_btpk(bt_model_t *model) {
+    int n_layers = model->config.n_layers;
+    int max_k_padded;
+    int max_m;
+    size_t max_layer_size = 0;
+    int l;
+
+    bt_fpga_reset_layout_state();
+    bt_fpga_n_layers = n_layers;
+    bt_fpga_layer_locs = (bt_fpga_layer_loc_t *)calloc((size_t)n_layers,
+                           sizeof(bt_fpga_layer_loc_t));
+    if (!bt_fpga_layer_locs) {
+        fprintf(stderr, "[FPGA] OOM allocating layer layout table\n");
+        return -1;
+    }
+
+    bt_fpga_model_limits(model, &max_k_padded, &max_m);
+
+    for (l = 0; l < n_layers; l++) {
         btpk_layer_t *bl = &model->btpk->layers[l];
         btpk_weight_t *wts[] = {
             &bl->wq, &bl->wk, &bl->wv, &bl->wo,
@@ -382,49 +759,69 @@ static void bt_fpga_prepare_layout_btpk(bt_model_t *model) {
             &bt_fpga_layer_locs[l].w_gate, &bt_fpga_layer_locs[l].w_up,
             &bt_fpga_layer_locs[l].w_down
         };
+        const char *names[] = { "wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down" };
+        uint32_t cursor = 0;
+        int i;
 
-        uint32_t offset = 0;
-        for (int i = 0; i < 7; i++) {
-            offset = (offset + BT_FPGA_BEAT_BYTES - 1) & ~(BT_FPGA_BEAT_BYTES - 1);
-            locs[i]->nib_off = offset;
-            locs[i]->nib_stride = wts[i]->nib_stride;
-            offset += (uint32_t)wts[i]->nib_size;
+        for (i = 0; i < BT_FPGA_WEIGHTS_PER_LAYER; i++) {
+            size_t nib_size = (size_t)wts[i]->nib_size;
+            size_t sign_size = (size_t)wts[i]->sign_size;
 
-            offset = (offset + BT_FPGA_BEAT_BYTES - 1) & ~(BT_FPGA_BEAT_BYTES - 1);
-            locs[i]->sign_off = offset;
-            locs[i]->sign_stride = wts[i]->sign_stride;
-            offset += (uint32_t)wts[i]->sign_size;
+            if (bt_fpga_mem_backend == BT_FPGA_MEM_CMA) {
+                if (bt_fpga_alloc_weight_loc_cma(locs[i], nib_size, sign_size,
+                                                 wts[i]->nib_stride, wts[i]->sign_stride,
+                                                 l, names[i]) != 0)
+                    goto fail;
+                if (bt_fpga_copy_btpk_weight(wts[i], locs[i]) != 0)
+                    goto fail;
+            } else {
+                bt_fpga_assign_weight_loc_devmem(locs[i], &cursor,
+                                                 nib_size, sign_size,
+                                                 wts[i]->nib_stride, wts[i]->sign_stride);
+            }
         }
 
-        if (offset > max_layer_size)
-            max_layer_size = offset;
+        if ((size_t)cursor > max_layer_size)
+            max_layer_size = cursor;
     }
 
-    bt_fpga_act_off = (uint32_t)((max_layer_size + 4095) & ~4095UL);
-    bt_fpga_res_off = bt_fpga_act_off + (uint32_t)((max_k_padded + 4095) & ~4095UL);
-    uint32_t total_needed = bt_fpga_res_off + (uint32_t)max_m * 4 + 4096;
-
-    if (total_needed > bt_fpga_ddr3_span) {
-        fprintf(stderr, "[FPGA] WARNING: need %u bytes but DDR3 span is %u\n",
-                total_needed, bt_fpga_ddr3_span);
+    if (bt_fpga_mem_backend == BT_FPGA_MEM_CMA) {
+        if (bt_fpga_prepare_scratch_cma(max_k_padded, max_m) != 0)
+            goto fail;
+    } else {
+        bt_fpga_weight_bytes = max_layer_size;
+        if (bt_fpga_prepare_scratch_devmem(max_layer_size, max_k_padded, max_m) != 0)
+            goto fail;
     }
 
-    bt_fpga_raw_buf = (int32_t *)malloc((size_t)max_m * sizeof(int32_t));
+    if (bt_fpga_prepare_raw_buf(max_m) != 0)
+        goto fail;
 
-    fprintf(stderr, "[FPGA] DDR3 layout (btpk): weights=%zu, act@0x%X, res@0x%X, total=%u\n",
-            max_layer_size, bt_fpga_act_off, bt_fpga_res_off, total_needed);
+    fprintf(stderr,
+            "[FPGA] layout (%s, btpk): weights=%zu, act=%zu, res=%zu\n",
+            bt_fpga_backend_name(bt_fpga_mem_backend),
+            bt_fpga_weight_bytes, bt_fpga_act_buf.size, bt_fpga_res_buf.size);
+    if (bt_fpga_mem_backend == BT_FPGA_MEM_CMA) {
+        fprintf(stderr,
+                "[FPGA] preloaded btpk weights once: %zu bytes across %d layers\n",
+                bt_fpga_weight_bytes, n_layers);
+    }
+    return 0;
+
+fail:
+    bt_fpga_reset_layout_state();
+    return -1;
 }
 
 /* ================================================================
- * Load one layer's weights to DDR3
- *
- * Two paths:
- *   - .btpk: pre-striped blobs in mmap → flat memcpy per weight
- *   - GGUF : software T-MAC → on-the-fly engine striping (slow)
+ * Runtime helpers
  * ================================================================ */
 
 static void bt_fpga_load_layer(bt_model_t *model, int layer) {
-    if (bt_fpga_cached_layer == layer) return;
+    if (bt_fpga_mem_backend == BT_FPGA_MEM_CMA)
+        return;
+    if (bt_fpga_cached_layer == layer)
+        return;
 
     if (model->btpk) {
         btpk_layer_t *bl = &model->btpk->layers[layer];
@@ -438,83 +835,60 @@ static void bt_fpga_load_layer(bt_model_t *model, int layer) {
             &bt_fpga_layer_locs[layer].w_gate, &bt_fpga_layer_locs[layer].w_up,
             &bt_fpga_layer_locs[layer].w_down
         };
-        for (int i = 0; i < 7; i++) {
-            memcpy((void *)(bt_fpga_ddr3 + locs[i]->nib_off),
-                   wts[i]->nib_data, wts[i]->nib_size);
-            memcpy((void *)(bt_fpga_ddr3 + locs[i]->sign_off),
-                   wts[i]->sign_data, wts[i]->sign_size);
+        int i;
+
+        for (i = 0; i < BT_FPGA_WEIGHTS_PER_LAYER; i++) {
+            memcpy((void *)locs[i]->nib.cpu, wts[i]->nib_data, (size_t)wts[i]->nib_size);
+            memcpy((void *)locs[i]->sign.cpu, wts[i]->sign_data, (size_t)wts[i]->sign_size);
         }
-        bt_fpga_cached_layer = layer;
-        return;
+    } else {
+        bt_layer_weights_t *lw = &model->weights.layers[layer];
+        bt_tmac_weight_t *wts[] = {
+            lw->wq.tmac, lw->wk.tmac, lw->wv.tmac, lw->wo.tmac,
+            lw->w_gate.tmac, lw->w_up.tmac, lw->w_down.tmac
+        };
+        bt_fpga_wt_loc_t *locs[] = {
+            &bt_fpga_layer_locs[layer].wq, &bt_fpga_layer_locs[layer].wk,
+            &bt_fpga_layer_locs[layer].wv, &bt_fpga_layer_locs[layer].wo,
+            &bt_fpga_layer_locs[layer].w_gate, &bt_fpga_layer_locs[layer].w_up,
+            &bt_fpga_layer_locs[layer].w_down
+        };
+        int i;
+
+        for (i = 0; i < BT_FPGA_WEIGHTS_PER_LAYER; i++)
+            bt_fpga_repack_weight_to_loc(wts[i], locs[i]);
     }
 
-    bt_layer_weights_t *lw = &model->weights.layers[layer];
-    bt_tmac_weight_t *wts[] = {
-        lw->wq.tmac, lw->wk.tmac, lw->wv.tmac, lw->wo.tmac,
-        lw->w_gate.tmac, lw->w_up.tmac, lw->w_down.tmac
-    };
-    bt_fpga_wt_loc_t *locs[] = {
-        &bt_fpga_layer_locs[layer].wq, &bt_fpga_layer_locs[layer].wk,
-        &bt_fpga_layer_locs[layer].wv, &bt_fpga_layer_locs[layer].wo,
-        &bt_fpga_layer_locs[layer].w_gate, &bt_fpga_layer_locs[layer].w_up,
-        &bt_fpga_layer_locs[layer].w_down
-    };
-
-    for (int i = 0; i < 7; i++)
-        bt_fpga_repack_to_ddr3(wts[i], locs[i]);
-
     bt_fpga_cached_layer = layer;
-    fprintf(stderr, "[FPGA] loading layer %d\n", layer);
 }
-
-/* ================================================================
- * Upload INT8 activations to DDR3 (pad K to multiple of 3)
- * ================================================================ */
 
 static void bt_fpga_upload_activations(const int8_t *q8_buf, int K) {
     int k_padded = ((K + 2) / 3) * 3;
-    uint8_t *dst = (uint8_t *)bt_fpga_ddr3 + bt_fpga_act_off;
+    uint8_t *dst = (uint8_t *)bt_fpga_act_buf.cpu;
+
     memcpy(dst, q8_buf, (size_t)K);
-    for (int i = K; i < k_padded; i++)
-        dst[i] = 0;
+    memset(dst + K, 0, (size_t)(k_padded - K));
 }
-
-/* ================================================================
- * FPGA GEMV: run one T-MAC matrix-vector multiply
- * ================================================================ */
-
-static int bt_fpga_gemv_count = 0;
 
 static void bt_fpga_gemv(const bt_tmac_weight_t *tw,
                          const bt_fpga_wt_loc_t *loc,
                          int32_t *results) {
     int M = tw->rows;
     int K = ((tw->cols + 2) / 3) * 3;
-
-    uint32_t nib_phys = bt_fpga_ddr3_avm_base + loc->nib_off;
-    uint32_t sign_phys = bt_fpga_ddr3_avm_base + loc->sign_off;
-    uint32_t act_phys = bt_fpga_ddr3_avm_base + bt_fpga_act_off;
-    uint32_t res_phys = bt_fpga_ddr3_avm_base + bt_fpga_res_off;
-
+    uint32_t act_phys = bt_fpga_act_buf.dma_addr;
+    uint32_t res_phys = bt_fpga_res_buf.dma_addr;
     int rows_done = 0;
+
     while (rows_done < M) {
         int tile_m = M - rows_done;
+        uint32_t tile_nib;
+        uint32_t tile_sign;
+
         if (tile_m > BT_FPGA_MAX_DIM_M)
             tile_m = BT_FPGA_MAX_DIM_M;
 
-        uint32_t tile_nib = nib_phys + (uint32_t)rows_done * loc->nib_stride;
-        uint32_t tile_sign = sign_phys + (uint32_t)rows_done * loc->sign_stride;
-
-        /* Debug: dump registers before first GEMV */
-        if (bt_fpga_gemv_count == 0) {
-            fprintf(stderr, "[FPGA] first GEMV: M=%d K=%d\n", M, K);
-            fprintf(stderr, "  NIB_BASE  =0x%08X (AVM)\n", tile_nib);
-            fprintf(stderr, "  SIGN_BASE =0x%08X (AVM)\n", tile_sign);
-            fprintf(stderr, "  ACT_BASE  =0x%08X (AVM)\n", act_phys);
-            fprintf(stderr, "  RES_BASE  =0x%08X (AVM)\n", res_phys);
-            fprintf(stderr, "  STATUS before START=0x%08X\n",
-                    bt_fpga_reg_read(BT_REG_STATUS));
-        }
+        tile_nib = loc->nib.dma_addr + (uint32_t)rows_done * (uint32_t)loc->nib_stride;
+        tile_sign = loc->sign.dma_addr + (uint32_t)rows_done * (uint32_t)loc->sign_stride;
 
         bt_fpga_reg_write(BT_REG_NIB_BASE, tile_nib);
         bt_fpga_reg_write(BT_REG_SIGN_BASE, tile_sign);
@@ -525,22 +899,6 @@ static void bt_fpga_gemv(const bt_tmac_weight_t *tw,
         bt_fpga_reg_write(BT_REG_RES_DDR3_BASE, res_phys);
         bt_fpga_reg_write(BT_REG_CTRL, BT_CTRL_START | BT_CTRL_DDR3_MODE);
 
-        if (bt_fpga_gemv_count == 0) {
-            /* Read back immediately after START */
-            fprintf(stderr, "  STATUS after START =0x%08X\n",
-                    bt_fpga_reg_read(BT_REG_STATUS));
-            /* Readback registers to verify writes took effect */
-            fprintf(stderr, "  Readback NIB_BASE  =0x%08X\n",
-                    bt_fpga_reg_read(BT_REG_NIB_BASE));
-            fprintf(stderr, "  Readback DIM_M     =%u\n",
-                    bt_fpga_reg_read(BT_REG_DIM_M));
-            fprintf(stderr, "  Readback DIM_K     =%u\n",
-                    bt_fpga_reg_read(BT_REG_DIM_K));
-            fprintf(stderr, "  Readback SIGN_BASE =0x%08X\n",
-                    bt_fpga_reg_read(BT_REG_SIGN_BASE));
-        }
-        bt_fpga_gemv_count++;
-
         if (bt_fpga_wait_done() < 0) {
             fprintf(stderr, "[FPGA] GEMV timeout M=%d K=%d tile_offset=%d\n",
                     M, K, rows_done);
@@ -549,52 +907,51 @@ static void bt_fpga_gemv(const bt_tmac_weight_t *tw,
             continue;
         }
 
-        memcpy(&results[rows_done],
-               (void *)(bt_fpga_ddr3 + bt_fpga_res_off),
+        memcpy(&results[rows_done], (const void *)bt_fpga_res_buf.cpu,
                (size_t)tile_m * sizeof(int32_t));
         rows_done += tile_m;
     }
 }
 
-/* ================================================================
- * FPGA-accelerated GEMV with dequantization
- * ================================================================ */
-
 static void bt_fpga_gemv_dequant(float *out, const bt_tmac_weight_t *tw,
                                  const bt_fpga_wt_loc_t *loc,
                                  float inv_scale) {
+    int r;
+    float dequant;
+
     bt_fpga_gemv(tw, loc, bt_fpga_raw_buf);
-    float dequant = inv_scale * tw->scale;
-    for (int r = 0; r < tw->rows; r++)
+    dequant = inv_scale * tw->scale;
+    for (r = 0; r < tw->rows; r++)
         out[r] = (float)bt_fpga_raw_buf[r] * dequant;
 }
 
-/* btpk variant — reads rows/cols/scale from btpk_weight_t directly
- * (weights have no bt_tmac_weight_t in the btpk load path). */
 static void bt_fpga_gemv_dequant_btpk(float *out, const btpk_weight_t *w,
                                       const bt_fpga_wt_loc_t *loc,
                                       float inv_scale) {
     int M = w->rows;
     int K = w->k_padded;
-
-    uint32_t nib_phys  = bt_fpga_ddr3_avm_base + loc->nib_off;
-    uint32_t sign_phys = bt_fpga_ddr3_avm_base + loc->sign_off;
-    uint32_t act_phys  = bt_fpga_ddr3_avm_base + bt_fpga_act_off;
-    uint32_t res_phys  = bt_fpga_ddr3_avm_base + bt_fpga_res_off;
-
+    uint32_t act_phys = bt_fpga_act_buf.dma_addr;
+    uint32_t res_phys = bt_fpga_res_buf.dma_addr;
     int rows_done = 0;
+    float dequant;
+    int r;
+
     while (rows_done < M) {
         int tile_m = M - rows_done;
-        if (tile_m > BT_FPGA_MAX_DIM_M) tile_m = BT_FPGA_MAX_DIM_M;
+        uint32_t tile_nib;
+        uint32_t tile_sign;
 
-        uint32_t tile_nib  = nib_phys  + (uint32_t)rows_done * loc->nib_stride;
-        uint32_t tile_sign = sign_phys + (uint32_t)rows_done * loc->sign_stride;
+        if (tile_m > BT_FPGA_MAX_DIM_M)
+            tile_m = BT_FPGA_MAX_DIM_M;
 
-        bt_fpga_reg_write(BT_REG_NIB_BASE,      tile_nib);
-        bt_fpga_reg_write(BT_REG_SIGN_BASE,     tile_sign);
-        bt_fpga_reg_write(BT_REG_DIM_M,         (uint32_t)tile_m);
-        bt_fpga_reg_write(BT_REG_DIM_K,         (uint32_t)K);
-        bt_fpga_reg_write(BT_REG_DIM_N3,        (uint32_t)(K / 3));
+        tile_nib = loc->nib.dma_addr + (uint32_t)rows_done * (uint32_t)loc->nib_stride;
+        tile_sign = loc->sign.dma_addr + (uint32_t)rows_done * (uint32_t)loc->sign_stride;
+
+        bt_fpga_reg_write(BT_REG_NIB_BASE, tile_nib);
+        bt_fpga_reg_write(BT_REG_SIGN_BASE, tile_sign);
+        bt_fpga_reg_write(BT_REG_DIM_M, (uint32_t)tile_m);
+        bt_fpga_reg_write(BT_REG_DIM_K, (uint32_t)K);
+        bt_fpga_reg_write(BT_REG_DIM_N3, (uint32_t)(K / 3));
         bt_fpga_reg_write(BT_REG_ACT_DDR3_BASE, act_phys);
         bt_fpga_reg_write(BT_REG_RES_DDR3_BASE, res_phys);
         bt_fpga_reg_write(BT_REG_CTRL, BT_CTRL_START | BT_CTRL_DDR3_MODE);
@@ -608,14 +965,13 @@ static void bt_fpga_gemv_dequant_btpk(float *out, const btpk_weight_t *w,
             continue;
         }
 
-        memcpy(&bt_fpga_raw_buf[rows_done],
-               (void *)(bt_fpga_ddr3 + bt_fpga_res_off),
+        memcpy(&bt_fpga_raw_buf[rows_done], (const void *)bt_fpga_res_buf.cpu,
                (size_t)tile_m * sizeof(int32_t));
         rows_done += tile_m;
     }
 
-    float dequant = inv_scale * w->scale;
-    for (int r = 0; r < M; r++)
+    dequant = inv_scale * w->scale;
+    for (r = 0; r < M; r++)
         out[r] = (float)bt_fpga_raw_buf[r] * dequant;
 }
 
