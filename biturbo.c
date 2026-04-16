@@ -64,6 +64,12 @@ static void* bt_calloc(size_t count, size_t size) {
     return p;
 }
 
+static double bt_timespec_elapsed_sec(struct timespec start,
+                                      struct timespec end) {
+    return (double)(end.tv_sec - start.tv_sec) +
+           (double)(end.tv_nsec - start.tv_nsec) / 1e9;
+}
+
 /* ================================================================
  * §1. GGUF PARSER — reads model config, tokenizer, and weight pointers
  *
@@ -1039,6 +1045,8 @@ void bt_forward(bt_model_t* model, int token, int pos) {
     bt_config_t* cfg = &model->config;
     bt_weights_t* w = &model->weights;
     bt_state_t* s = &model->state;
+    struct timespec ts_layers_start, ts_layers_end;
+    struct timespec ts_lm_head_start, ts_lm_head_end;
 
     int dim = cfg->dim;
     int head_dim = BT_HEAD_DIM(cfg);
@@ -1056,6 +1064,7 @@ void bt_forward(bt_model_t* model, int token, int pos) {
     }
 
     /* ── Transformer layers ── */
+    clock_gettime(CLOCK_MONOTONIC, &ts_layers_start);
     for (int l = 0; l < cfg->n_layers; l++) {
         bt_layer_weights_t* lw = &w->layers[l];
         bt_kv_cache_t* kv = &s->kv[l];
@@ -1239,7 +1248,12 @@ void bt_forward(bt_model_t* model, int token, int pos) {
         for (int i = 0; i < dim; i++) s->x[i] += s->xb[i];
     }
 
+    clock_gettime(CLOCK_MONOTONIC, &ts_layers_end);
+    s->profile_last_layers_sec =
+        bt_timespec_elapsed_sec(ts_layers_start, ts_layers_end);
+
     /* Stage 14: Final norm + LM head (tied to token embedding) */
+    clock_gettime(CLOCK_MONOTONIC, &ts_lm_head_start);
     rms_norm(s->xb, s->x, w->final_norm, dim, cfg->norm_eps);
 
     /* LM head: logits[v] = dot(xb, token_embd[v]) for all vocab
@@ -1280,6 +1294,9 @@ void bt_forward(bt_model_t* model, int token, int pos) {
             s->logits[v] = sum;
         }
     }
+    clock_gettime(CLOCK_MONOTONIC, &ts_lm_head_end);
+    s->profile_last_lm_head_sec =
+        bt_timespec_elapsed_sec(ts_lm_head_start, ts_lm_head_end);
 }
 
 /* ================================================================
@@ -2329,6 +2346,7 @@ void bt_free_model(bt_model_t* model) {
 void bt_generate(bt_model_t* model, bt_sampler_t* sampler,
                  const char* prompt, int max_tokens) {
     bt_tokenizer_t* tok = &model->tokenizer;
+    bt_state_t* s = &model->state;
 
     int* prompt_tokens = (int*)bt_calloc(max_tokens, sizeof(int));
     int n_prompt = bt_encode(tok, prompt, prompt_tokens, max_tokens, 1);
@@ -2343,17 +2361,32 @@ void bt_generate(bt_model_t* model, bt_sampler_t* sampler,
     int prev_token = 0;
     struct timespec ts_start;
     int gen_count = 0;
+    double layers_total = 0.0;
+    double lm_head_total = 0.0;
+    double sampling_total = 0.0;
 
     for (int pos = 0; pos < max_tokens; pos++) {
+        int generating = (pos >= n_prompt - 1);
+        if (generating && gen_count == 0)
+            clock_gettime(CLOCK_MONOTONIC, &ts_start);
+
         bt_forward(model, token, pos);
+        if (generating) {
+            layers_total += s->profile_last_layers_sec;
+            lm_head_total += s->profile_last_lm_head_sec;
+        }
 
         int next;
         if (pos < n_prompt - 1) {
             next = prompt_tokens[pos + 1];
         } else {
+            struct timespec ts_sample_start, ts_sample_end;
+            clock_gettime(CLOCK_MONOTONIC, &ts_sample_start);
             next = bt_sample(sampler, model->state.logits,
                              model->config.vocab_size);
-            if (gen_count == 0) clock_gettime(CLOCK_MONOTONIC, &ts_start);
+            clock_gettime(CLOCK_MONOTONIC, &ts_sample_end);
+            sampling_total +=
+                bt_timespec_elapsed_sec(ts_sample_start, ts_sample_end);
             gen_count++;
         }
 
@@ -2373,10 +2406,15 @@ void bt_generate(bt_model_t* model, bt_sampler_t* sampler,
     if (gen_count > 1) {
         struct timespec ts_end;
         clock_gettime(CLOCK_MONOTONIC, &ts_end);
-        double elapsed = (double)(ts_end.tv_sec - ts_start.tv_sec)
-                       + (double)(ts_end.tv_nsec - ts_start.tv_nsec) / 1e9;
+        double elapsed = bt_timespec_elapsed_sec(ts_start, ts_end);
         fprintf(stderr, "biturbo: %d tokens in %.2fs (%.1f tok/s)\n",
                 gen_count, elapsed, (double)gen_count / elapsed);
+        fprintf(stderr,
+                "biturbo: profile (generated tokens): layers=%.2fs (%.2f s/token), "
+                "lm_head=%.2fs (%.2f s/token), sampling=%.2fs (%.4f s/token)\n",
+                layers_total, layers_total / (double)gen_count,
+                lm_head_total, lm_head_total / (double)gen_count,
+                sampling_total, sampling_total / (double)gen_count);
     }
     free(prompt_tokens);
 }

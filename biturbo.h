@@ -239,6 +239,8 @@ typedef struct {
     float* q_qjl;       /* QJL query projection scratch [head_dim]   */
     float* logits;      /* output logits [vocab_size]                */
     bt_kv_cache_t* kv;  /* [n_layers] KV cache                      */
+    double profile_last_layers_sec;   /* last forward() transformer-stack time */
+    double profile_last_lm_head_sec;  /* last forward() LM-head time           */
 } bt_state_t;
 
 /* ============================================================
