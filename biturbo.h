@@ -219,6 +219,31 @@ typedef struct {
     btpk_layer_t* layers;     /* [n_layers] ternary weights      */
 } bt_btpk_weights_t;
 
+enum {
+    BT_PROFILE_LAYER_STAGE_ATTN_NORM = 0,
+    BT_PROFILE_LAYER_STAGE_QKV,
+    BT_PROFILE_LAYER_STAGE_ROPE,
+    BT_PROFILE_LAYER_STAGE_KV_CACHE,
+    BT_PROFILE_LAYER_STAGE_ATTENTION,
+    BT_PROFILE_LAYER_STAGE_ATTN_OUT,
+    BT_PROFILE_LAYER_STAGE_ATTN_RESIDUAL,
+    BT_PROFILE_LAYER_STAGE_FFN_IN,
+    BT_PROFILE_LAYER_STAGE_SQRELU,
+    BT_PROFILE_LAYER_STAGE_FFN_OUT,
+    BT_PROFILE_LAYER_STAGE_FFN_RESIDUAL,
+    BT_PROFILE_LAYER_STAGE_COUNT
+};
+
+enum {
+    BT_PROFILE_QKV_STAGE_QUANT = 0,
+    BT_PROFILE_QKV_STAGE_PREP,
+    BT_PROFILE_QKV_STAGE_UPLOAD,
+    BT_PROFILE_QKV_STAGE_WQ,
+    BT_PROFILE_QKV_STAGE_WK,
+    BT_PROFILE_QKV_STAGE_WV,
+    BT_PROFILE_QKV_STAGE_COUNT
+};
+
 /* ============================================================
  * Inference state
  * ============================================================ */
@@ -240,6 +265,8 @@ typedef struct {
     float* logits;      /* output logits [vocab_size]                */
     bt_kv_cache_t* kv;  /* [n_layers] KV cache                      */
     double profile_last_layers_sec;   /* last forward() transformer-stack time */
+    double profile_last_layer_stage_sec[BT_PROFILE_LAYER_STAGE_COUNT];
+    double profile_last_qkv_stage_sec[BT_PROFILE_QKV_STAGE_COUNT];
     double profile_last_lm_head_sec;  /* last forward() LM-head time           */
 } bt_state_t;
 
