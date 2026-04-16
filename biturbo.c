@@ -1606,7 +1606,7 @@ void bt_forward(bt_model_t* model, int token, int pos) {
     {
         int nb_per_row = dim / BT_QK_K;
         size_t row_bytes = (size_t)nb_per_row * sizeof(bt_block_q6k_t);
-        float* tmp = s->xb2;  /* reuse scratch buffer (>= dim floats) */
+        #pragma omp parallel for schedule(static)
         for (int v = 0; v < cfg->vocab_size; v++) {
             const bt_block_q6k_t* ev = (const bt_block_q6k_t*)(w->token_embedding + (size_t)v * row_bytes);
             s->logits[v] = vec_dot_q6k_f32(ev, s->xb, dim);
