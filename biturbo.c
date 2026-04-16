@@ -140,6 +140,37 @@ static void dequantize_q6k(const bt_block_q6k_t* x, float* y, int k) {
     }
 }
 
+/* Fused Q6_K dequantization and dot product*/
+static float vec_dot_q6k_f32(const bt_block_q6k_t* x, const float* y, int k) {
+    float sum = 0.0f;
+    int nb = k >> 8;
+    for (int i = 0; i < nb; i++) {
+        float d = bt_f16_to_f32(x[i].d);
+        const uint8_t* ql = x[i].ql;
+        const uint8_t* qh = x[i].qh;
+        const int8_t* sc = x[i].scales;
+        for (int n = 0; n < BT_QK_K; n += 128) {
+            for (int l = 0; l < 32; ++l) {
+                int is = l >> 4;
+                int8_t q1 = (int8_t)((ql[l+ 0] & 0xF) | (((qh[l]>>0)&3)<<4)) - 32;
+                int8_t q2 = (int8_t)((ql[l+32] & 0xF) | (((qh[l]>>2)&3)<<4)) - 32;
+                int8_t q3 = (int8_t)((ql[l+ 0]  >> 4) | (((qh[l]>>4)&3)<<4)) - 32;
+                int8_t q4 = (int8_t)((ql[l+32]  >> 4) | (((qh[l]>>6)&3)<<4)) - 32;
+                
+                sum += y[l+ 0] * (d * sc[is+0] * q1);
+                sum += y[l+32] * (d * sc[is+2] * q2);
+                sum += y[l+64] * (d * sc[is+4] * q3);
+                sum += y[l+96] * (d * sc[is+6] * q4);
+            }
+            y  += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+    return sum;
+}
+
 typedef struct {
     const uint8_t* base;
     size_t pos;
@@ -1264,34 +1295,7 @@ void bt_forward(bt_model_t* model, int token, int pos) {
         float* tmp = s->xb2;  /* reuse scratch buffer (>= dim floats) */
         for (int v = 0; v < cfg->vocab_size; v++) {
             const bt_block_q6k_t* ev = (const bt_block_q6k_t*)(w->token_embedding + (size_t)v * row_bytes);
-            dequantize_q6k(ev, tmp, dim);
-            float sum = 0.0f;
-#ifdef __ARM_NEON
-            float32x4_t acc = vdupq_n_f32(0.0f);
-            int d = 0;
-            for (; d + 3 < dim; d += 4) {
-                float32x4_t xv = vld1q_f32(s->xb + d);
-                float32x4_t tv = vld1q_f32(tmp + d);
-#ifdef __aarch64__
-                acc = vfmaq_f32(acc, xv, tv);
-#else
-                acc = vmlaq_f32(acc, xv, tv);
-#endif
-            }
-#ifdef __aarch64__
-            sum = vaddvq_f32(acc);
-#else
-            {
-                float32x2_t s2 = vadd_f32(vget_low_f32(acc), vget_high_f32(acc));
-                s2 = vpadd_f32(s2, s2);
-                sum = vget_lane_f32(s2, 0);
-            }
-#endif
-            for (; d < dim; d++) sum += s->xb[d] * tmp[d];
-#else
-            for (int d = 0; d < dim; d++) sum += s->xb[d] * tmp[d];
-#endif
-            s->logits[v] = sum;
+            s->logits[v] = vec_dot_q6k_f32(ev, s->xb, dim);
         }
     }
     clock_gettime(CLOCK_MONOTONIC, &ts_lm_head_end);
